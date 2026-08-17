@@ -3,3 +3,26 @@
 *.sh text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+
+# Prettier and Ruff both emit LF; pin these so Git does not rewrite them to CRLF
+# on Windows checkouts and reintroduce format-check failures.
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+package-lock.json text eol=lf
+uv.lock text eol=lf
+.nvmrc text eol=lf
+.python-version text eol=lf
+.prettierrc text eol=lf
+.prettierignore text eol=lf
+.env.example text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf

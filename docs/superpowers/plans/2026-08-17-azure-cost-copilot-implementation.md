@@ -15,6 +15,12 @@
 - Work on feature branches created from `staging`; never implement directly on `main`.
 - Use TDD for each behavior: failing test, minimal implementation, passing test.
 - Keep shell scripts LF-only and validate them with ShellCheck.
+- Do not install or invoke npm, pnpm, Yarn, Bun, or Docker on the workshop laptop.
+  JavaScript dependency installation, frontend tests/builds, Playwright package
+  installation, and image builds run only on GitHub-hosted runners or Azure
+  Container Registry build agents.
+- Use MCP Playwright for browser interaction and visual verification from VS
+  Code. Do not require a locally installed Playwright browser or CLI.
 - Never store access tokens, client secrets, Foundry keys, ACR passwords, raw cost payloads, prompts, or model answers in source control or telemetry.
 - The one-time OIDC bootstrap runs under the operator's existing `az login`; all subsequent Azure provisioning and deployment runs through GitHub Actions.
 - Treat `staging` as integration and `main` as production. Production must deploy image digests already tested in staging.
@@ -187,9 +193,10 @@ describe("normalizeCurrency", () => {
 });
 ```
 
-- [ ] **Step 6: Scaffold Vite and implement the shared frontend contracts**
+- [ ] **Step 6: Scaffold Vite in a GitHub-hosted setup job and implement the shared frontend contracts**
 
-Run in `frontend/`:
+Run only on a GitHub-hosted runner in `frontend/`; do not run these commands on
+the workshop laptop:
 
 ```bash
 npm create vite@latest . -- --template react-ts
@@ -234,7 +241,7 @@ export function normalizeCurrency(currencies: string[]): string {
 *.yaml text eol=lf
 ```
 
-Run:
+Run in the GitHub-hosted frontend validation job:
 
 ```bash
 cd frontend && npm test -- --run src/api/contracts.test.ts
@@ -421,27 +428,48 @@ metrics only, and require `tag_key` when grouping by tag. Define the enums and
 dimension mapping explicitly:
 
 ```python
+from datetime import date
 from enum import StrEnum
+from typing import Self
+
+from pydantic import BaseModel, model_validator
 
 
 class CostMetric(StrEnum):
-  ACTUAL = "ActualCost"
-  AMORTIZED = "AmortizedCost"
+    ACTUAL = "ActualCost"
+    AMORTIZED = "AmortizedCost"
 
 
 class CostGrouping(StrEnum):
-  SERVICE = "ServiceName"
-  RESOURCE_GROUP = "ResourceGroupName"
-  RESOURCE = "ResourceId"
-  TAG = "Tag"
+    SERVICE = "ServiceName"
+    RESOURCE_GROUP = "ResourceGroupName"
+    RESOURCE = "ResourceId"
+    TAG = "Tag"
 
 
-@property
-def azure_dimension(self) -> str:
-  if self.grouping is CostGrouping.TAG:
-    assert self.tag_key is not None
-    return self.tag_key
-  return self.grouping.value
+class CostFilter(BaseModel):
+    start: date
+    end: date
+    metric: CostMetric
+    grouping: CostGrouping
+    tag_key: str | None = None
+
+    @model_validator(mode="after")
+    def validate_range_and_grouping(self) -> Self:
+        if self.end < self.start:
+            raise ValueError("end must be on or after start")
+        if (self.end - self.start).days > 366:
+            raise ValueError("date range cannot exceed 366 days")
+        if self.grouping is CostGrouping.TAG and not self.tag_key:
+            raise ValueError("tag_key is required for tag grouping")
+        return self
+
+    @property
+    def azure_dimension(self) -> str:
+        if self.grouping is CostGrouping.TAG:
+            assert self.tag_key is not None
+            return self.tag_key
+        return self.grouping.value
 ```
 
 `build_query` must produce structured JSON and never concatenate user values
@@ -449,7 +477,7 @@ into a URL. Use grouping type `TagKey` for tag queries and `Dimension` otherwise
 
 ```python
 def build_query(filters: CostFilter, granularity: str) -> dict[str, object]:
-  grouping_type = "TagKey" if filters.grouping is CostGrouping.TAG else "Dimension"
+    grouping_type = "TagKey" if filters.grouping is CostGrouping.TAG else "Dimension"
     return {
         "type": "ActualCost" if filters.metric is CostMetric.ACTUAL else "AmortizedCost",
         "timeframe": "Custom",
@@ -682,7 +710,7 @@ logs, local storage owned by the app, or telemetry.
 
 - [ ] **Step 4: Run focused frontend tests**
 
-Run: `cd frontend && npm test -- --run src/app/runtime-config.test.ts src/api/client.test.ts`
+Run in GitHub Actions: `cd frontend && npm test -- --run src/app/runtime-config.test.ts src/api/client.test.ts`
 
 Expected: all tests pass.
 
@@ -696,6 +724,8 @@ git commit -m "feat: add runtime config and Entra authentication"
 ### Task 7: Build the Analytics-First Cost Dashboard
 
 **Files:**
+- Create: `frontend/src/app/AppShell.tsx`
+- Create: `frontend/src/features/dashboard/CostCommandBar.tsx`
 - Create: `frontend/src/features/dashboard/CostDashboard.tsx`
 - Create: `frontend/src/features/dashboard/CostFilters.tsx`
 - Create: `frontend/src/features/dashboard/KpiStrip.tsx`
@@ -720,16 +750,43 @@ real-time. Do not cache bearer tokens or raw responses outside Query's memory.
 
 - [ ] **Step 3: Implement the approved visual direction**
 
-Use an unframed operational layout: compact top navigation, fixed-height filter
-bar, stable KPI grid, large trend chart, breakdown chart/table, and a 360px chat
-rail. Define a multi-hue palette (Azure blue, teal, coral, ink, neutral), Source
-Sans 3 for interface text, and IBM Plex Mono for numeric values. Use ECharts,
-Lucide icons, visible focus states, and reduced-motion styles. No landing hero,
-decorative orbs, nested cards, or oversized panel headings.
+Before implementation, the assigned frontend subagent MUST load and follow the
+`frontend-design` skill. Use the attached Azure Portal Cost Analysis screenshot
+as the primary structural reference, while creating original React components
+and charts rather than embedding or tracing the screenshot.
+
+Build an Azure-style operational shell with:
+
+- A narrow left navigation rail containing Overview, Activity log, Access
+  control, Resources, **Cost analysis** as the selected item, Monitoring, and
+  Help. Collapse it to an icon drawer on small screens.
+- A page header showing the subscription name and `Cost analysis`, followed by a
+  compact command bar with functional Refresh and Download controls. Do not add
+  inert Save/Share buttons.
+- A single fixed-height scope strip for subscription, view (`AccumulatedCosts`),
+  month/date range, and add-filter controls.
+- Three stable KPI blocks for actual cost, forecast, and budget. Budget state
+  must visibly distinguish under-budget and over-budget values.
+- A large accumulated-cost area chart matching the screenshot's information
+  model: actual accumulated cost, over-budget segment, translucent forecast,
+  overage forecast, and a dotted monthly-budget reference line.
+- Three equal-width donut breakdown panels below the trend chart: Service name,
+  Location, and Resource group name, each with a compact ranked legend and exact
+  currency values.
+- A 360px contextual AI chat rail on wide screens that can collapse without
+  resizing chart heights; on tablet/mobile it becomes a full-width lower panel.
+
+Keep sections unframed except for the three repeated breakdown panels and chat
+tool. Use square or <=8px corners, dense spacing, visible focus states, stable
+chart dimensions, reduced-motion support, Source Sans 3 for interface text, and
+IBM Plex Mono for numeric values. Define a multi-hue chart palette derived from
+Azure blue, teal, green, amber, red, purple, ink, and neutral gray. Use ECharts
+and Lucide icons. Do not create a landing hero, decorative orbs, nested cards,
+oversized headings, nonfunctional controls, or a one-hue dashboard.
 
 - [ ] **Step 4: Run component tests and responsive checks**
 
-Run:
+Run in the GitHub-hosted frontend validation job:
 
 ```bash
 cd frontend
@@ -737,7 +794,12 @@ npm test -- --run src/features/dashboard/CostDashboard.test.tsx
 npm run build
 ```
 
-Expected: tests and production build pass.
+Use MCP Playwright screenshots at 1440x900, 1024x768, and 390x844 against the
+deployed staging URL to verify that the
+area chart and all donut charts are nonblank, text does not overlap or overflow,
+the chat rail does not resize charts, and the mobile navigation/filter controls
+remain usable. Expected: component tests, screenshot checks, accessibility scan,
+and production build pass.
 
 - [ ] **Step 5: Commit**
 
@@ -790,7 +852,7 @@ initializer that drops authorization headers and all chat/cost properties.
 
 - [ ] **Step 4: Run focused tests and accessibility scan**
 
-Run:
+Run in the GitHub-hosted frontend validation job:
 
 ```bash
 cd frontend
@@ -842,9 +904,9 @@ exec nginx -g 'daemon off;'
 Nginx serves the SPA, `/health/live`, and immutable assets with long cache
 headers; `config.js` uses `no-store`.
 
-- [ ] **Step 3: Build and run both containers locally**
+- [ ] **Step 3: Build and run both containers on GitHub-hosted runners**
 
-Run:
+Run only in GitHub Actions; Docker is not a laptop prerequisite:
 
 ```bash
 docker compose build
@@ -899,9 +961,9 @@ Conditional Access are interactive. The required automated gate validates the
 redirect and all authenticated API behavior with OIDC. The workshop runbook adds
 a human acceptance check for browser login before production approval.
 
-- [ ] **Step 4: Run Playwright locally**
+- [ ] **Step 4: Run automated Playwright in CI and inspect with MCP Playwright**
 
-Run:
+Run only on the GitHub-hosted runner:
 
 ```bash
 cd frontend
@@ -909,8 +971,9 @@ npx playwright install --with-deps chromium
 npm run test:e2e
 ```
 
-Expected: desktop and mobile Chromium projects pass; screenshots show no blank
-chart, overflow, overlap, or unreadable control text.
+Expected: desktop and mobile Chromium projects pass. Then use MCP Playwright
+against the staging URL to confirm screenshots show no blank chart, overflow,
+overlap, or unreadable control text.
 
 - [ ] **Step 5: Commit**
 
@@ -1249,9 +1312,9 @@ CodeQL gate, staging deployment/test evidence, automatic promotion PR, human
 browser-login acceptance check, production approval, deployment verification,
 Application Insights queries, troubleshooting, and teardown commands.
 
-- [ ] **Step 5: Run complete local verification**
+- [ ] **Step 5: Run complete GitHub-hosted verification**
 
-Run:
+Run in the CI workflow, not on the workshop laptop:
 
 ```bash
 cd backend && uv run ruff check . && uv run mypy src && uv run pytest --cov=cost_copilot

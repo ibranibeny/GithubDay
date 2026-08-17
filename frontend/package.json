@@ -7,9 +7,15 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "vitest",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "lint:lockfile": "node scripts/check-lockfile.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "engines": {
+    "node": ">=22.12"
   },
   "dependencies": {
     "@azure/msal-browser": "^5.18.0",
