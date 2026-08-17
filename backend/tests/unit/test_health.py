@@ -1,5 +1,7 @@
+import logging
 from collections.abc import Awaitable, Callable
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cost_copilot.main import app, create_app
@@ -66,6 +68,35 @@ def test_cors_allows_only_configured_origins() -> None:
 
     assert allowed.headers["access-control-allow-origin"] == "http://localhost:5173"
     assert "access-control-allow-origin" not in rejected.headers
+
+
+def test_cors_does_not_allow_credentials() -> None:
+    response = build_client().options(
+        "/health/live",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "access-control-allow-credentials" not in response.headers
+    assert "authorization" in response.headers["access-control-allow-headers"].lower()
+
+
+def test_readiness_failure_is_logged_without_dependency_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def checker() -> None:
+        raise RuntimeError("preflight failed for https://internal.example")
+
+    with caplog.at_level(logging.WARNING):
+        build_client(checker).get("/health/ready")
+
+    assert "Readiness check failed (RuntimeError)" in caplog.text
+    assert "internal.example" not in caplog.text
+    assert "preflight" not in caplog.text
 
 
 def test_cost_and_chat_routes_are_not_registered_yet() -> None:

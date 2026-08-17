@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
@@ -9,13 +10,14 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from conftest import TEST_API_CLIENT_ID, TEST_TENANT_ID
+from constants import TEST_API_CLIENT_ID, TEST_TENANT_ID
 from cost_copilot.auth import (
     EntraSigningKeyResolver,
     get_signing_key_resolver,
     require_cost_reader,
 )
 from cost_copilot.config import get_settings
+from cost_copilot.errors import FORBIDDEN_ROLE_DETAIL
 
 SigningKeyResolverStub = Callable[[str], str]
 
@@ -45,6 +47,7 @@ def build_claims(**overrides: Any) -> dict[str, Any]:
         "iss": f"https://login.microsoftonline.com/{TEST_TENANT_ID}/v2.0",
         "aud": TEST_API_CLIENT_ID,
         "tid": TEST_TENANT_ID,
+        "ver": "2.0",
         "oid": "11111111-2222-3333-4444-555555555555",
         "roles": ["Cost.Read"],
         "iat": now,
@@ -91,6 +94,7 @@ def test_cost_reader_role_is_required() -> None:
         require_cost_reader({"roles": ["Other.Role"]})
 
     assert error.value.status_code == 403
+    assert error.value.detail == FORBIDDEN_ROLE_DETAIL
 
 
 def test_cost_reader_role_is_returned_unchanged() -> None:
@@ -152,6 +156,10 @@ def test_malformed_token_is_unauthorized(protected_client: TestClient) -> None:
         pytest.param({"tid": "99999999-9999-9999-9999-999999999999"}, id="tenant-mismatch"),
         pytest.param({"aud": "another-api"}, id="wrong-audience"),
         pytest.param({"iss": "https://evil.example/v2.0"}, id="wrong-issuer"),
+        pytest.param({"ver": None}, id="missing-version"),
+        pytest.param({"ver": "1.0"}, id="v1-token"),
+        pytest.param({"oid": None}, id="missing-object-id"),
+        pytest.param({"nonce": "6f1c"}, id="id-token-shaped"),
     ],
 )
 def test_rejected_tokens_are_unauthorized(
@@ -220,3 +228,33 @@ def test_default_signing_key_resolver_targets_the_configured_tenant() -> None:
     assert resolver.jwks_uri == (
         f"https://login.microsoftonline.com/{TEST_TENANT_ID}/discovery/v2.0/keys"
     )
+
+
+def test_signing_key_failure_is_logged_without_token_or_exception_text(
+    rsa_key_pair: tuple[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    private_pem, _ = rsa_key_pair
+    credential = encode(private_pem)
+
+    def failing_resolver(_token: str) -> str:
+        raise RuntimeError("jwks fetch failed for https://internal.example/keys")
+
+    with caplog.at_level(logging.INFO), TestClient(build_protected_app(failing_resolver)) as client:
+        client.get("/protected", headers={"Authorization": f"Bearer {credential}"})
+
+    assert "Signing key lookup failed (RuntimeError)" in caplog.text
+    assert "internal.example" not in caplog.text
+    assert credential not in caplog.text
+
+
+def test_rejected_token_is_logged_without_the_token(
+    protected_client: TestClient, rsa_key_pair: tuple[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    private_pem, _ = rsa_key_pair
+    credential = encode(private_pem, aud="another-api")
+
+    with caplog.at_level(logging.INFO):
+        protected_client.get("/protected", headers={"Authorization": f"Bearer {credential}"})
+
+    assert "Access token rejected" in caplog.text
+    assert credential not in caplog.text

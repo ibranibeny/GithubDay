@@ -36,6 +36,14 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 
+[tool.coverage.run]
+source = ["src/cost_copilot"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 95
+
 # Pinned so the lockfile resolves against public PyPI regardless of any
 # UV_DEFAULT_INDEX pointing at an internal mirror.
 [[tool.uv.index]]
