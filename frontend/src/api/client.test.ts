@@ -5,12 +5,14 @@ import {
   ApiForbiddenError,
   ApiHttpError,
   ApiNetworkError,
+  ApiParseError,
   ApiUnauthorizedError,
   CORRELATION_ID_HEADER,
   apiFetch,
 } from "./client";
 
 const TOKEN = "eyJ-super-secret-access-token";
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const runtimeConfig = {
   tenantId: "11111111-1111-1111-1111-111111111111",
@@ -131,6 +133,74 @@ describe("apiFetch", () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
 
     await expect(apiFetch("/api/costs/summary", tokenProvider)).resolves.toBeUndefined();
+  });
+
+  it("forwards an abort signal to fetch", async () => {
+    const controller = new AbortController();
+    fetchMock.mockResolvedValue(jsonResponse({}));
+
+    await apiFetch("/api/costs/summary", tokenProvider, { signal: controller.signal });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.signal).toBe(controller.signal);
+  });
+
+  it("maps a malformed JSON body to a typed parse error", async () => {
+    fetchMock.mockResolvedValue(
+      new Response("{ not json at all", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const error = await apiFetch("/api/costs/summary", tokenProvider).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiParseError);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).not.toBeInstanceOf(SyntaxError);
+    expect((error as ApiError).correlationId).toBeTruthy();
+    expect((error as Error).message).not.toContain("not json at all");
+  });
+
+  it("rejects a 200 that is not JSON instead of resolving undefined", async () => {
+    fetchMock.mockResolvedValue(
+      new Response("<html>gateway sign-in page</html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    );
+
+    const error = await apiFetch("/api/costs/summary", tokenProvider).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiParseError);
+    expect((error as Error).message).not.toContain("gateway sign-in page");
+  });
+
+  it("mints a correlation ID when crypto.randomUUID is unavailable", async () => {
+    vi.stubGlobal("crypto", {
+      getRandomValues: (array: Uint8Array) => {
+        for (let index = 0; index < array.length; index += 1) {
+          array[index] = index * 11;
+        }
+        return array;
+      },
+    });
+    fetchMock.mockResolvedValue(jsonResponse({}));
+
+    await apiFetch("/api/costs/summary", tokenProvider);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)[CORRELATION_ID_HEADER]).toMatch(UUID_V4);
+  });
+
+  it("mints a correlation ID when Web Crypto is missing entirely", async () => {
+    vi.stubGlobal("crypto", undefined);
+    fetchMock.mockResolvedValue(jsonResponse({}));
+
+    await apiFetch("/api/costs/summary", tokenProvider);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)[CORRELATION_ID_HEADER]).toMatch(UUID_V4);
   });
 
   it("never leaks the token to the console, storage, or the error surface", async () => {

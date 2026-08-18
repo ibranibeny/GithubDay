@@ -62,23 +62,10 @@ export function getMsalInstance(
 }
 
 /**
- * MsalProvider already calls initialize() and handleRedirectPromise(); this exists for the
- * non-React entry points. Both are idempotent, so calling it alongside the provider is safe.
+ * MsalProvider owns initialize() and handleRedirectPromise() for the whole app, so nothing here
+ * drives them: a second initialization path would race the provider's and swallow the redirect
+ * result the gate depends on.
  */
-export async function initializeAuth(
-  config: RuntimeConfig = getRuntimeConfig(),
-): Promise<PublicClientApplication> {
-  const instance = getMsalInstance(config);
-  await instance.initialize();
-  const redirectResult = await instance.handleRedirectPromise();
-  const account =
-    redirectResult?.account ?? instance.getActiveAccount() ?? instance.getAllAccounts()[0];
-  if (account) {
-    instance.setActiveAccount(account);
-  }
-  return instance;
-}
-
 export async function acquireAccessToken(
   instance: IPublicClientApplication,
   config: RuntimeConfig,

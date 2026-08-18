@@ -29,11 +29,11 @@ describe("parseRuntimeConfig", () => {
     }
 
     expect(thrown).toBeInstanceOf(RuntimeConfigError);
-    expect((thrown as RuntimeConfigError).fields).toEqual([
-      "spaClientId",
-      "apiClientId",
-      "apiBaseUrl",
-    ]);
+    // Zod does not promise an issue order, so the set is what matters, not the sequence.
+    expect((thrown as RuntimeConfigError).fields).toEqual(
+      expect.arrayContaining(["spaClientId", "apiClientId", "apiBaseUrl"]),
+    );
+    expect((thrown as RuntimeConfigError).fields).toHaveLength(3);
   });
 
   it("parses a fully populated configuration", () => {

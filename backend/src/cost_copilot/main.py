@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cost_copilot import __version__
 from cost_copilot.config import get_settings
+from cost_copilot.correlation import CORRELATION_ID_HEADER, CorrelationIdMiddleware
 from cost_copilot.errors import SafeErrorMiddleware, register_exception_handlers
 from cost_copilot.routers import chat, costs, health
 from cost_copilot.telemetry import setup_telemetry
@@ -40,13 +41,19 @@ def create_app() -> fastapi.FastAPI:
     )
     # add_middleware prepends, so CORSMiddleware must be added last to wrap the
     # error middleware and put CORS headers on sanitized 500 responses too.
+    # Correlation sits between the two: outside SafeErrorMiddleware so a sanitized
+    # 500 still carries the header, inside CORS so the browser may read it.
     app.add_middleware(SafeErrorMiddleware)
+    app.add_middleware(CorrelationIdMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=False,  # the browser sends bearer tokens, not cookies
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        # A header the SPA sends must be advertised here or the preflight fails.
+        allow_headers=["Authorization", "Content-Type", CORRELATION_ID_HEADER, "traceparent"],
+        # ...and a header the SPA reads back must be exposed, or fetch hides it.
+        expose_headers=[CORRELATION_ID_HEADER],
     )
     register_exception_handlers(app)
     app.include_router(health.router)

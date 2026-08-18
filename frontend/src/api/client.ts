@@ -45,10 +45,51 @@ export class ApiNetworkError extends ApiError {
   }
 }
 
+/** A 2xx the client cannot read. The body is never quoted: it may carry account data. */
+export class ApiParseError extends ApiError {
+  constructor(correlationId: string, reason: string) {
+    super(`API response could not be parsed: ${reason}`, correlationId);
+    this.name = "ApiParseError";
+  }
+}
+
 export interface ApiFetchOptions {
   method?: string;
   body?: unknown;
   correlationId?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * `crypto.randomUUID` is restricted to secure contexts, so a plain-http origin (a LAN
+ * preview, a proxy that terminates TLS elsewhere) would otherwise throw before every
+ * request. The value is a trace correlator, never a token or a nonce.
+ */
+function newCorrelationId(): string {
+  const webCrypto = typeof crypto === "undefined" ? undefined : crypto;
+  if (typeof webCrypto?.randomUUID === "function") {
+    return webCrypto.randomUUID();
+  }
+
+  const bytes = new Uint8Array(16);
+  if (typeof webCrypto?.getRandomValues === "function") {
+    webCrypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; // RFC 4122 version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant 1
+
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join("-");
 }
 
 export async function apiFetch<T = unknown>(
@@ -57,7 +98,7 @@ export async function apiFetch<T = unknown>(
   options: ApiFetchOptions = {},
 ): Promise<T> {
   const { apiBaseUrl } = getRuntimeConfig();
-  const correlationId = options.correlationId ?? crypto.randomUUID();
+  const correlationId = options.correlationId ?? newCorrelationId();
   const url = `${apiBaseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 
   const token = await tokenProvider();
@@ -78,6 +119,7 @@ export async function apiFetch<T = unknown>(
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
       credentials: "omit",
       mode: "cors",
+      signal: options.signal,
     });
   } catch {
     // The transport error can echo the request, including its Authorization header, so it is
@@ -98,8 +140,15 @@ export async function apiFetch<T = unknown>(
   if (response.status === 204) {
     return undefined as T;
   }
+  // A non-JSON 200 is a proxy or gateway answering in the API's place. Resolving it as
+  // undefined would hand the caller a hole to dereference later; failing here is louder.
   if (!(response.headers.get("content-type") ?? "").includes("application/json")) {
-    return undefined as T;
+    throw new ApiParseError(correlationId, "unexpected content type");
   }
-  return (await response.json()) as T;
+  try {
+    return (await response.json()) as T;
+  } catch {
+    // SyntaxError quotes the offending body, so it is dropped rather than chained.
+    throw new ApiParseError(correlationId, "malformed JSON body");
+  }
 }

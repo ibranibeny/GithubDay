@@ -39,6 +39,7 @@ from cost_copilot.config import Settings
 
 __all__ = [
     "COST_DEPENDENCY",
+    "CORRELATION_ID_ATTRIBUTE",
     "DEPENDENCY_DURATION_METRIC",
     "FOUNDRY_DEPENDENCY",
     "SAFE_ATTRIBUTE_NAMES",
@@ -70,12 +71,18 @@ DEPENDENCY_DURATION_METRIC = "cost_copilot.dependency.duration"
 OK_STATUS = "ok"
 ERROR_STATUS = "error"
 
+# The only value on the allowlist that originates outside this process. It is
+# bounded and character-checked in `correlation.normalize_correlation_id` before
+# it is ever set, so what reaches the exporter is an opaque token, not free text.
+CORRELATION_ID_ATTRIBUTE: Final = "correlation_id"
+
 # The allowlist is the rule: an attribute that is not named here never leaves the
 # process, so a new attribute is invisible until it is reviewed and added.
 SAFE_ATTRIBUTE_NAMES = frozenset(
     {
         "dependency",
         "dependency.name",
+        CORRELATION_ID_ATTRIBUTE,
         "status",
         "status_code",
         "duration_ms",
