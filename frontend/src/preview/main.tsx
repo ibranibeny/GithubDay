@@ -4,8 +4,9 @@ import { createRoot } from "react-dom/client";
 
 import { CostDashboard } from "../features/dashboard/CostDashboard";
 import { CostDataContext } from "../features/dashboard/useCostData";
+import { ChatGatewayContext } from "../features/chat/useCostChat";
 import "../styles/tokens.css";
-import { PREVIEW_FILTER, previewGateway } from "./fixtures";
+import { PREVIEW_FILTER, previewChatGateway, previewGateway } from "./fixtures";
 
 // preview.html is not a Rollup input, so this module can only ever be reached through the dev
 // server. The guard makes that contract fail loudly instead of silently shipping fixtures.
@@ -24,7 +25,9 @@ createRoot(container).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <CostDataContext.Provider value={previewGateway}>
-        <CostDashboard subscriptionName="Contoso Workshop" initialFilter={PREVIEW_FILTER} />
+        <ChatGatewayContext.Provider value={previewChatGateway}>
+          <CostDashboard subscriptionName="Contoso Workshop" initialFilter={PREVIEW_FILTER} />
+        </ChatGatewayContext.Provider>
       </CostDataContext.Provider>
     </QueryClientProvider>
   </StrictMode>,

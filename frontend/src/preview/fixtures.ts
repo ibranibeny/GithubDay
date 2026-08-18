@@ -1,4 +1,5 @@
-import type { CostFilter, CostGrouping } from "../api/contracts";
+import type { ChatResponse, CostFilter, CostGrouping } from "../api/contracts";
+import type { ChatGateway } from "../features/chat/useCostChat";
 import type {
   BreakdownItem,
   CostBreakdownResponse,
@@ -131,4 +132,41 @@ export const previewGateway: CostGateway = {
       total: TOTAL,
       ...BREAKDOWNS[grouping],
     }),
+};
+
+// A fixed, grounded reply so the preview can demonstrate the assistant without a backend or a
+// model. The figures match the breakdown fixtures above (App Service 25.37%, Cosmos DB 20.55% of
+// TOTAL), so evidence a reader applies lands on the same numbers the donuts draw.
+const CHAT_REPLY: ChatResponse = {
+  answer:
+    "August is tracking to $5,502.90 through the 19th \u2014 16.8% above July and $1,502.90 over the " +
+    "$4,000 budget. Azure App Service is the largest driver at $1,396.09 (25.4%), with Azure Cosmos " +
+    "DB next at $1,130.85. The accumulated line crossed the budget around 13 August.",
+  evidence: [
+    {
+      metric: "ActualCost",
+      dimension: "Azure App Service",
+      periodStart: "2026-08-01",
+      periodEnd: "2026-08-19",
+      amount: 1396.09,
+    },
+    {
+      metric: "ActualCost",
+      dimension: "Azure Cosmos DB",
+      periodStart: "2026-08-01",
+      periodEnd: "2026-08-19",
+      amount: 1130.85,
+    },
+  ],
+  chartActions: [
+    { kind: "highlight-series", grouping: "ServiceName", value: "Azure App Service" },
+    { kind: "set-filter", grouping: "ResourceGroupName" },
+    { kind: "set-filter", metric: "AmortizedCost" },
+  ],
+  explanationAvailable: true,
+};
+
+export const previewChatGateway: ChatGateway = {
+  // A short delay exercises the pending/aria-busy state without making screenshots flaky.
+  send: () => new Promise((resolve) => setTimeout(() => resolve(CHAT_REPLY), 250)),
 };
