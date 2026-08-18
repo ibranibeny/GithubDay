@@ -55,15 +55,18 @@ export function AppShell({ children, chat }: AppShellProps) {
               </li>
             ) : (
               <li key={label}>
-                {/* Disabled rather than a dead link: this build ships one section, and says so. */}
+                {/* Not a dead link and not a silent `disabled`: focusable, so a keyboard or
+                    screen reader user is told why the section does nothing. */}
                 <button
                   type="button"
                   className="rail__item"
-                  disabled
+                  aria-disabled="true"
+                  onClick={(event) => event.preventDefault()}
                   title={`${label} is not part of this build`}
                 >
                   <Icon size={16} aria-hidden />
                   <span className="rail__label">{label}</span>
+                  <span className="visually-hidden">(not available in this build)</span>
                 </button>
               </li>
             ),

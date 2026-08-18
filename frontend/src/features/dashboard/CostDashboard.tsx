@@ -55,6 +55,7 @@ export function CostDashboard({ subscriptionName, initialFilter }: CostDashboard
           <KpiStrip
             summary={summary.data}
             isPending={summary.isPending}
+            hasError={summary.isError}
             metric={filter.metric}
             budget={MONTHLY_BUDGET_USD}
             currency={currency}

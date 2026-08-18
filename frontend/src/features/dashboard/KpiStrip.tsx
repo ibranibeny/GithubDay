@@ -8,6 +8,7 @@ import { METRIC_LABELS, type CostSummaryResponse } from "./useCostData";
 export interface KpiStripProps {
   summary: CostSummaryResponse | undefined;
   isPending: boolean;
+  hasError: boolean;
   metric: CostMetric;
   budget: number;
   currency: string;
@@ -15,8 +16,18 @@ export interface KpiStripProps {
 
 const BLOCK_STYLE = { minHeight: `${KPI_BLOCK_HEIGHT}px` };
 
-export function KpiStrip({ summary, isPending, metric, budget, currency }: KpiStripProps) {
+export function KpiStrip({
+  summary,
+  isPending,
+  hasError,
+  metric,
+  budget,
+  currency,
+}: KpiStripProps) {
   const loading = isPending && !summary;
+  // A settled query with no data has nothing true to say, so the blocks say that rather than
+  // formatting an absent total as $0.00 and a budget as untouched.
+  const failed = !loading && (hasError || !summary);
   const consumed = summary ? summary.total / budget : 0;
   const overBudget = summary ? summary.total > budget : false;
   // Over budget the rail has to grow past the threshold, so the track spans the larger of the
@@ -32,10 +43,12 @@ export function KpiStrip({ summary, isPending, metric, budget, currency }: KpiSt
         <h2 className="eyebrow">{METRIC_LABELS[metric]}</h2>
         {loading ? (
           <Skeleton wide />
+        ) : failed || !summary ? (
+          <Unavailable />
         ) : (
           <>
             <p className="kpi__value num" data-testid="kpi-actual">
-              {formatCurrency(summary?.total ?? 0, currency)}
+              {formatCurrency(summary.total, currency)}
             </p>
             <p className="kpi__note">{describeChange(summary, currency)}</p>
           </>
@@ -46,7 +59,9 @@ export function KpiStrip({ summary, isPending, metric, budget, currency }: KpiSt
         <h2 className="eyebrow">Forecast</h2>
         {loading ? (
           <Skeleton wide />
-        ) : summary?.forecast == null ? (
+        ) : failed || !summary ? (
+          <Unavailable />
+        ) : summary.forecast == null ? (
           <>
             <p className="kpi__value kpi__value--absent">Forecast unavailable</p>
             <p className="kpi__note">
@@ -69,6 +84,8 @@ export function KpiStrip({ summary, isPending, metric, budget, currency }: KpiSt
         <h2 className="eyebrow">Monthly budget</h2>
         {loading ? (
           <Skeleton wide />
+        ) : failed || !summary ? (
+          <Unavailable />
         ) : (
           <>
             <p className="kpi__value num">{formatCurrency(budget, currency)}</p>
@@ -81,9 +98,9 @@ export function KpiStrip({ summary, isPending, metric, budget, currency }: KpiSt
             </div>
             <p className="kpi__note">
               {overBudget
-                ? `Over by ${formatCurrency((summary?.total ?? 0) - budget, currency)}.`
+                ? `Over by ${formatCurrency(summary.total - budget, currency)}.`
                 : `${formatPercent(consumed * 100)} used · ${formatCurrency(
-                    budget - (summary?.total ?? 0),
+                    budget - summary.total,
                     currency,
                   )} left.`}{" "}
               Set locally; no budget API is connected.
@@ -95,8 +112,16 @@ export function KpiStrip({ summary, isPending, metric, budget, currency }: KpiSt
   );
 }
 
-function describeChange(summary: CostSummaryResponse | undefined, currency: string): string {
-  if (!summary?.change || summary.previousTotal == null) {
+function Unavailable() {
+  return (
+    <p className="kpi__note" role="alert">
+      Cost totals are unavailable. Refresh to try again.
+    </p>
+  );
+}
+
+function describeChange(summary: CostSummaryResponse, currency: string): string {
+  if (!summary.change || summary.previousTotal == null) {
     return "No comparable previous period.";
   }
   const direction = summary.change.amount >= 0 ? "up" : "down";

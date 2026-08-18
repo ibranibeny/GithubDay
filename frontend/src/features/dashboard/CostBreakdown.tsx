@@ -76,6 +76,8 @@ export function CostBreakdownPanel({
           <p className="slot-message" role="alert">
             {label} did not load.
           </p>
+        ) : query.data.items.length === 0 && query.data.otherAmount <= 0 ? (
+          <p className="slot-message">No usage was recorded in this period.</p>
         ) : (
           <>
             <ReactECharts
@@ -97,14 +99,9 @@ export function CostBreakdownPanel({
         )}
       </div>
       <ol className="ranked">
-        {items.map((item, index) => (
-          <li key={item.name}>
-            <button
-              type="button"
-              className="ranked__row"
-              onClick={() => onFocusDimension(dimension)}
-              title={`Group the period by ${label.toLowerCase()}`}
-            >
+        {items.map((item, index) => {
+          const cells = (
+            <>
               <span
                 className="ranked__swatch"
                 style={{ backgroundColor: CHART_PALETTE[index % CHART_PALETTE.length] }}
@@ -113,9 +110,27 @@ export function CostBreakdownPanel({
               <span className="ranked__name">{item.name}</span>
               <span className="ranked__amount num">{formatCurrency(item.amount, currency)}</span>
               <span className="ranked__share num">{formatPercent(item.percentage)}</span>
-            </button>
-          </li>
-        ))}
+            </>
+          );
+          return (
+            <li key={item.name}>
+              {/* Already the grouping, so the row would be a no-op: it stops being a control. */}
+              {isActive ? (
+                <div className="ranked__row ranked__row--static">{cells}</div>
+              ) : (
+                <button
+                  type="button"
+                  className="ranked__row"
+                  onClick={() => onFocusDimension(dimension)}
+                  aria-label={`Group costs by ${label.toLowerCase()}: ${item.name}`}
+                  title={`Group the period by ${label.toLowerCase()}`}
+                >
+                  {cells}
+                </button>
+              )}
+            </li>
+          );
+        })}
         {query.data && query.data.otherAmount > 0 ? (
           <li className="ranked__rest">
             <span className="ranked__swatch ranked__swatch--rest" aria-hidden />

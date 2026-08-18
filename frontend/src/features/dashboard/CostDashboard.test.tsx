@@ -4,11 +4,17 @@ import userEvent from "@testing-library/user-event";
 import type { CSSProperties } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
-import { ApiForbiddenError } from "../../api/client";
+import { ApiForbiddenError, ApiHttpError } from "../../api/client";
 import type { CostFilter, CostGrouping } from "../../api/contracts";
 import tokensCss from "../../styles/tokens.css?raw";
 import { CostDashboard } from "./CostDashboard";
-import { TREND_SERIES_IDS, buildTrendOption } from "./chartOptions";
+import {
+  AXIS_LABEL_COLOR,
+  REST_SLICE_COLOR,
+  TREND_SERIES_IDS,
+  buildDonutOption,
+  buildTrendOption,
+} from "./chartOptions";
 import { KPI_BLOCK_HEIGHT, TREND_CHART_HEIGHT } from "./layout";
 import {
   CostDataContext,
@@ -255,6 +261,88 @@ describe("CostDashboard", () => {
     );
   });
 
+  it("says the totals are unavailable instead of printing zeros when the summary fails", async () => {
+    const gateway = makeGateway();
+    // A 4xx settles without retrying, so the strip is observed in its terminal error state.
+    gateway.fetchSummary.mockRejectedValue(new ApiHttpError(400, "correlation-2"));
+    renderDashboard(gateway);
+
+    const alerts = await screen.findAllByText("Cost totals are unavailable. Refresh to try again.");
+    expect(alerts).toHaveLength(3);
+    for (const alert of alerts) {
+      expect(alert).toHaveAttribute("role", "alert");
+    }
+    expect(screen.queryByText("$0.00")).not.toBeInTheDocument();
+    expect(screen.queryByText(/left\./)).not.toBeInTheDocument();
+    expect(screen.queryByText("No comparable previous period.")).not.toBeInTheDocument();
+  });
+
+  it("states that no usage was recorded when the trend returns no points", async () => {
+    const gateway = makeGateway();
+    gateway.fetchTrend.mockResolvedValue({ ...TREND, points: [] });
+    renderDashboard(gateway);
+    await waitForLoaded();
+
+    expect(
+      within(screen.getByTestId("trend-slot")).getByText("No usage was recorded in this period."),
+    ).toBeInTheDocument();
+  });
+
+  it("states that no usage was recorded when a breakdown has no slices", async () => {
+    const gateway = makeGateway();
+    gateway.fetchBreakdown.mockImplementation((_filter: CostFilter, grouping: CostGrouping) =>
+      Promise.resolve({ ...breakdownFor(grouping), total: 0, items: [], otherAmount: 0 }),
+    );
+    renderDashboard(gateway);
+    await waitForLoaded();
+
+    const panel = screen.getByRole("region", { name: "Service name" });
+    expect(within(panel).getByText("No usage was recorded in this period.")).toBeInTheDocument();
+  });
+
+  it("keeps the period options fixed when an earlier month is selected", async () => {
+    const user = userEvent.setup();
+    renderDashboard(makeGateway());
+    await waitForLoaded();
+
+    const period = screen.getByLabelText("Period") as HTMLSelectElement;
+    const before = Array.from(period.options, (option) => option.value);
+    expect(before).toHaveLength(6);
+    expect(before).toContain("2026-08");
+
+    await user.selectOptions(period, before[0]);
+    await waitFor(() => {
+      expect(period).toHaveValue(before[0]);
+    });
+
+    expect(Array.from(period.options, (option) => option.value)).toEqual(before);
+  });
+
+  it("marks the refresh control busy while cost queries are in flight", () => {
+    renderDashboard({
+      fetchSummary: () => new Promise(() => {}),
+      fetchTrend: () => new Promise(() => {}),
+      fetchBreakdown: () => new Promise(() => {}),
+    });
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("names ranked rows with the grouping action and leaves the active grouping inert", async () => {
+    renderDashboard(makeGateway());
+    await waitForLoaded();
+
+    const active = screen.getByRole("region", { name: "Service name" });
+    expect(within(active).queryAllByRole("button")).toHaveLength(0);
+
+    const other = screen.getByRole("region", { name: "Resource group name" });
+    expect(
+      within(other).getByRole("button", {
+        name: "Group costs by resource group name: rg-workshop-prod",
+      }),
+    ).toBeInTheDocument();
+  });
+
   it("keeps keyboard focus visible on the command bar controls", async () => {
     const user = userEvent.setup();
     renderDashboard(makeGateway());
@@ -309,6 +397,65 @@ describe("buildTrendOption", () => {
       TREND_SERIES_IDS.overBudget,
       TREND_SERIES_IDS.budget,
     ]);
+  });
+
+  it("leaves the over-budget series at zero while the budget is never reached", () => {
+    const option = buildTrendOption({ ...input, budget: 10_000, forecastTotal: null });
+    const actual = option.series[0].data as (number | null)[];
+    const over = option.series[1].data as (number | null)[];
+
+    // The accumulated total stays below the line, so "actual" carries the whole running sum.
+    expect(actual[0]).toBeCloseTo(180.25, 2);
+    expect(actual[1]).toBeCloseTo(390.75, 2);
+    expect(actual[2]).toBeCloseTo(651.5, 2);
+    expect(over.filter((value) => value !== null)).toEqual([0, 0, 0]);
+  });
+
+  it("pins the actual series at the budget when it is exceeded on day one", () => {
+    const option = buildTrendOption({ ...input, budget: 100, forecastTotal: null });
+    const actual = option.series[0].data as (number | null)[];
+    const over = option.series[1].data as (number | null)[];
+
+    expect(actual.filter((value) => value !== null)).toEqual([100, 100, 100]);
+    expect(over[0]).toBeCloseTo(80.25, 2);
+    expect(over[1]).toBeCloseTo(290.75, 2);
+    expect(over[2]).toBeCloseTo(551.5, 2);
+  });
+
+  it("draws axis labels at a colour that clears AA contrast on white", () => {
+    const option = buildTrendOption(input);
+    const xAxis = option.xAxis as { axisLabel: { color: string } };
+    const yAxis = option.yAxis as { axisLabel: { color: string } };
+
+    expect(AXIS_LABEL_COLOR).toBe("#6b7280");
+    expect(xAxis.axisLabel.color).toBe(AXIS_LABEL_COLOR);
+    expect(yAxis.axisLabel.color).toBe(AXIS_LABEL_COLOR);
+  });
+});
+
+describe("buildDonutOption", () => {
+  const items = [
+    { name: "Azure App Service", amount: 3100.2, percentage: 59.5 },
+    { name: "Azure Cosmos DB", amount: 1600.22, percentage: 30.71 },
+  ];
+
+  it("omits the Other slice when nothing is left over", () => {
+    const option = buildDonutOption({ items, otherAmount: 0, currency: "USD", animate: false });
+    const data = option.series[0].data as { name: string }[];
+
+    expect(data).toHaveLength(2);
+    expect(data.map((slice) => slice.name)).not.toContain("Other");
+  });
+
+  it("paints the Other slice with the neutral the legend rest swatch uses", () => {
+    const option = buildDonutOption({ items, otherAmount: 510, currency: "USD", animate: false });
+    const data = option.series[0].data as { name: string; itemStyle?: { color: string } }[];
+
+    expect(data).toHaveLength(3);
+    expect(data[2].name).toBe("Other");
+    expect(data[2].itemStyle?.color).toBe(REST_SLICE_COLOR);
+    // The legend swatch paints `--line`, so the slice and the swatch cannot drift apart.
+    expect(tokensCss).toContain(`--line: ${REST_SLICE_COLOR}`);
   });
 });
 

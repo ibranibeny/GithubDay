@@ -1,5 +1,5 @@
 import { SlidersHorizontal, X } from "lucide-react";
-import { useId, useState, type FormEvent } from "react";
+import { useId, useMemo, useState, type FormEvent } from "react";
 
 import type { CostFilter, CostGrouping, CostMetric } from "../../api/contracts";
 import { formatMonthLabel } from "./format";
@@ -31,6 +31,10 @@ export interface CostFiltersProps {
 export function CostFilters({ filter, subscriptionName, onChange }: CostFiltersProps) {
   const ids = useId();
   const month = filter.from.slice(0, 7);
+  // The window is anchored once, not on the current selection: re-anchoring on every change
+  // walks the list backwards and strands the reader with no route back to the newest month.
+  const [anchorMonth] = useState(month);
+  const monthChoices = useMemo(() => monthsEndingAt(anchorMonth, MONTH_CHOICES), [anchorMonth]);
   const [tagDraft, setTagDraft] = useState("");
   const [tagOpen, setTagOpen] = useState(false);
 
@@ -75,7 +79,7 @@ export function CostFilters({ filter, subscriptionName, onChange }: CostFiltersP
           value={month}
           onChange={(event) => apply({ month: event.target.value })}
         >
-          {monthsEndingAt(month, MONTH_CHOICES).map((choice) => (
+          {monthChoices.map((choice) => (
             <option key={choice} value={choice}>
               {formatMonthLabel(choice)}
             </option>

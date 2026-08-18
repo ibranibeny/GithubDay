@@ -21,7 +21,7 @@ export function CostCommandBar({
 }: CostCommandBarProps) {
   return (
     <div className="commandbar">
-      <button type="button" className="command" onClick={onRefresh}>
+      <button type="button" className="command" onClick={onRefresh} aria-busy={isFetching}>
         <RefreshCw size={14} aria-hidden className={isFetching ? "spin" : undefined} />
         Refresh
       </button>

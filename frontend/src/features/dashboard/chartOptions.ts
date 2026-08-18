@@ -20,8 +20,16 @@ export const CHART_PALETTE = [
 const AZURE = CHART_PALETTE[0];
 const RED = CHART_PALETTE[4];
 const INK = CHART_PALETTE[6];
-const AXIS = "#8a9099";
 const GRID_LINE = "#e6e8eb";
+
+/**
+ * Axis labels are 11px text, so they carry the 4.5:1 floor: `--ink-3` clears it at 4.83:1 where
+ * the lighter neutral the grid lines use would not.
+ */
+export const AXIS_LABEL_COLOR = "#6b7280";
+
+/** The `--line` token the legend's rest swatch paints, so the slice and the swatch agree. */
+export const REST_SLICE_COLOR = "#d8dbe0";
 
 export const TREND_SERIES_IDS = {
   actual: "actual-cost",
@@ -188,7 +196,7 @@ export function buildTrendOption(input: TrendChartInput): ChartOption {
       axisLine: { lineStyle: { color: GRID_LINE } },
       axisTick: { show: false },
       axisLabel: {
-        color: AXIS,
+        color: AXIS_LABEL_COLOR,
         fontSize: 11,
         formatter: (value: string) => formatDayLabel(value),
         hideOverlap: true,
@@ -198,7 +206,7 @@ export function buildTrendOption(input: TrendChartInput): ChartOption {
       type: "value",
       splitLine: { lineStyle: { color: GRID_LINE, type: "dashed" } },
       axisLabel: {
-        color: AXIS,
+        color: AXIS_LABEL_COLOR,
         fontSize: 11,
         formatter: (value: number) => formatCompactCurrency(value, currency),
       },
@@ -214,10 +222,20 @@ export interface DonutChartInput {
   animate: boolean;
 }
 
+interface DonutDatum {
+  name: string;
+  value: number;
+  itemStyle?: { color: string };
+}
+
 export function buildDonutOption(input: DonutChartInput): ChartOption {
-  const data = input.items.map((item) => ({ name: item.name, value: item.amount }));
+  const data: DonutDatum[] = input.items.map((item) => ({ name: item.name, value: item.amount }));
   if (input.otherAmount > 0) {
-    data.push({ name: "Other", value: input.otherAmount });
+    data.push({
+      name: "Other",
+      value: input.otherAmount,
+      itemStyle: { color: REST_SLICE_COLOR },
+    });
   }
   return {
     animation: input.animate,

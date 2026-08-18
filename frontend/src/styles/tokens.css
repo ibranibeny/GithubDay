@@ -589,6 +589,12 @@ body {
   background: var(--azure-soft);
 }
 
+.ranked__row--static,
+.ranked__row--static:hover {
+  background: none;
+  cursor: default;
+}
+
 .ranked__swatch {
   width: 10px;
   height: 10px;

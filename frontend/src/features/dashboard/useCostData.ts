@@ -54,6 +54,7 @@ export interface CostSummaryResponse extends CostContextFields {
   previousTotal: number | null;
   change: CostChange | null;
   forecast: number | null;
+  // TODO(Task 8): surface the top driver in the UI; the API already returns it.
   topDriver: TopDriver | null;
 }
 
@@ -279,5 +280,6 @@ export function downloadCsv(fileName: string, content: string): void {
   document.body.append(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  // WebKit latches the blob during the click task, so revoking has to wait a turn.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
