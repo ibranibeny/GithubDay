@@ -147,18 +147,41 @@ ensure_service_principal() {
 # `roles: ["Cost.Read"]`. Microsoft Graph rejects a service-principal
 # appRoleAssignment for a role that does not allow the Application member type.
 #
-# Microsoft Graph replaces a complex property wholesale on PATCH, so the whole
-# `api` object (scope plus pre-authorization) has to be sent in one request.
-# Pre-authorising the SPA removes the consent prompt without needing a tenant
-# administrator to run `az ad app permission admin-consent`.
+# Graph validates `api.preAuthorizedApplications` against scopes that ALREADY
+# exist, so a scope cannot be defined and pre-authorized in one PATCH (it fails
+# with "Permission Id ... cannot be found in the AppPermissions sets"). The
+# scope is therefore created first, then the SPA is pre-authorized in a second
+# PATCH that re-sends the identical scope so it survives whether Graph merges or
+# replaces the `api` object. Pre-authorising the SPA removes the consent prompt
+# without needing a tenant administrator to run `az ad app permission admin-consent`.
 configure_api_app() {
-  local api_client_id="$1" spa_client_id="$2" object_id payload
+  local api_client_id="$1" spa_client_id="$2" object_id scopes_json payload_scope payload_preauth
   object_id="$(app_object_id "$api_client_id")"
   if [ -z "$object_id" ] && [ "$DRY_RUN" != "1" ]; then
     die "could not resolve the object ID of the API app registration"
   fi
 
-  payload="$(
+  # The Cost.Read delegated scope, reused verbatim in both PATCHes below.
+  scopes_json="$(
+    cat <<JSON
+[
+      {
+        "id": "${COST_READ_SCOPE_ID}",
+        "value": "access_as_user",
+        "type": "User",
+        "isEnabled": true,
+        "adminConsentDisplayName": "Read Azure cost data",
+        "adminConsentDescription": "Allows the Cost Copilot single-page application to read Azure cost data on behalf of the signed-in user.",
+        "userConsentDisplayName": "Read your Azure cost data",
+        "userConsentDescription": "Allows the Cost Copilot application to read Azure cost data on your behalf."
+      }
+    ]
+JSON
+  )"
+
+  # PATCH 1: app role, identifier URI, and the Cost.Read scope. No
+  # preAuthorizedApplications yet - the scope must be persisted first.
+  payload_scope="$(
     cat <<JSON
 {
   "identifierUris": ["api://${api_client_id}"],
@@ -174,18 +197,22 @@ configure_api_app() {
   ],
   "api": {
     "requestedAccessTokenVersion": 2,
-    "oauth2PermissionScopes": [
-      {
-        "id": "${COST_READ_SCOPE_ID}",
-        "value": "Cost.Read",
-        "type": "User",
-        "isEnabled": true,
-        "adminConsentDisplayName": "Read Azure cost data",
-        "adminConsentDescription": "Allows the Cost Copilot single-page application to read Azure cost data on behalf of the signed-in user.",
-        "userConsentDisplayName": "Read your Azure cost data",
-        "userConsentDescription": "Allows the Cost Copilot application to read Azure cost data on your behalf."
-      }
-    ],
+    "oauth2PermissionScopes": ${scopes_json}
+  }
+}
+JSON
+  )"
+  graph_request patch "${GRAPH_BASE}/applications/${object_id}" "$payload_scope" >/dev/null
+  ok "API app ${api_client_id} exposes app role and scope Cost.Read (identifierUri api://${api_client_id})"
+
+  # PATCH 2: pre-authorize the SPA now that the scope exists. The scope list is
+  # re-sent so a wholesale `api` replace cannot drop it.
+  payload_preauth="$(
+    cat <<JSON
+{
+  "api": {
+    "requestedAccessTokenVersion": 2,
+    "oauth2PermissionScopes": ${scopes_json},
     "preAuthorizedApplications": [
       {
         "appId": "${spa_client_id}",
@@ -196,8 +223,7 @@ configure_api_app() {
 }
 JSON
   )"
-  graph_request patch "${GRAPH_BASE}/applications/${object_id}" "$payload" >/dev/null
-  ok "API app ${api_client_id} exposes app role and scope Cost.Read (identifierUri api://${api_client_id})"
+  graph_request patch "${GRAPH_BASE}/applications/${object_id}" "$payload_preauth" >/dev/null
   ok "SPA ${spa_client_id} is pre-authorized for Cost.Read on the API app"
 }
 

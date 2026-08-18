@@ -30,7 +30,7 @@ vi.mock("@azure/msal-react", () => ({
   useIsAuthenticated: () => mocks.isAuthenticated,
 }));
 
-const scopes = ["api://api-client-id/Cost.Read"];
+const scopes = ["api://api-client-id/access_as_user"];
 const instance = {} as never;
 
 function anEvent(eventType: string, interactionType: InteractionType): EventMessage {

@@ -32,9 +32,12 @@ const APP_CONFIG = {
   apiBaseUrl: "http://localhost:8000",
 };
 
-const AUTHORIZE_URL = /^https:\/\/login\.microsoftonline\.com\/[^/]+\/oauth2\/v2\.0\/authorize/;
+const AUTHORIZE_URL =
+  /^https:\/\/login\.microsoftonline\.com\/[^/]+\/oauth2\/v2\.0\/authorize/;
 
-test("sends an anonymous visitor to the configured tenant authority", async ({ page }) => {
+test("sends an anonymous visitor to the configured tenant authority", async ({
+  page,
+}) => {
   // Two injections, because index.html loads /config.js as a classic script in <head>: an init
   // script alone would be overwritten by the checked-in development file, whose identifiers are
   // intentionally blank. Replacing the response is what makes the configuration stick; the init
@@ -65,7 +68,9 @@ test("sends an anonymous visitor to the configured tenant authority", async ({ p
   expect(authorize.pathname).toBe(`/${TENANT_ID}/oauth2/v2.0/authorize`);
   expect(authorize.searchParams.get("client_id")).toBe(SPA_CLIENT_ID);
   expect(authorize.searchParams.get("response_type")).toBe("code");
-  expect(authorize.searchParams.get("scope")).toContain(`api://${API_CLIENT_ID}/Cost.Read`);
+  expect(authorize.searchParams.get("scope")).toContain(
+    `api://${API_CLIENT_ID}/access_as_user`,
+  );
   // Authorization code flow with PKCE: a missing challenge would mean a code interceptable in
   // transit, which is the whole reason a SPA may not use an implicit grant.
   expect(authorize.searchParams.get("code_challenge")).toBeTruthy();

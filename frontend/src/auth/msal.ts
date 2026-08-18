@@ -18,7 +18,9 @@ export class InteractiveAuthRequiredError extends Error {
 }
 
 export function buildApiScope(config: RuntimeConfig): string {
-  return `api://${config.apiClientId}/Cost.Read`;
+  // The delegated scope is named access_as_user (Azure convention); it cannot share the
+  // Cost.Read value with the app role. Authorization is the app role in the roles claim.
+  return `api://${config.apiClientId}/access_as_user`;
 }
 
 export function buildMsalConfig(config: RuntimeConfig): Configuration {

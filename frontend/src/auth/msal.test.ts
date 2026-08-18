@@ -63,8 +63,8 @@ afterEach(() => {
 });
 
 describe("buildApiScope", () => {
-  it("targets the Cost.Read scope of the API app registration", () => {
-    expect(buildApiScope(config)).toBe("api://33333333-3333-3333-3333-333333333333/Cost.Read");
+  it("targets the access_as_user scope of the API app registration", () => {
+    expect(buildApiScope(config)).toBe("api://33333333-3333-3333-3333-333333333333/access_as_user");
   });
 });
 
@@ -99,7 +99,7 @@ describe("acquireAccessToken", () => {
     expect(token).toBe(TOKEN);
     expect(fake.acquireTokenSilent).toHaveBeenCalledWith(
       expect.objectContaining({
-        scopes: ["api://33333333-3333-3333-3333-333333333333/Cost.Read"],
+        scopes: ["api://33333333-3333-3333-3333-333333333333/access_as_user"],
         account,
       }),
     );
@@ -116,7 +116,7 @@ describe("acquireAccessToken", () => {
     expect(error).toBeInstanceOf(InteractiveAuthRequiredError);
     expect(fake.acquireTokenRedirect).toHaveBeenCalledWith(
       expect.objectContaining({
-        scopes: ["api://33333333-3333-3333-3333-333333333333/Cost.Read"],
+        scopes: ["api://33333333-3333-3333-3333-333333333333/access_as_user"],
       }),
     );
   });
