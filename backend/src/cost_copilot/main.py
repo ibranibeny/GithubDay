@@ -1,12 +1,29 @@
 """FastAPI application factory."""
 
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from cost_copilot import __version__
 from cost_copilot.config import get_settings
 from cost_copilot.errors import SafeErrorMiddleware, register_exception_handlers
-from cost_copilot.routers import costs, health
+from cost_copilot.routers import chat, costs, health
+
+
+@asynccontextmanager
+async def application_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Builds every upstream client once, in dependency order.
+
+    The cost lifespan owns the shared Azure credential, so it is entered first
+    and torn down last; the chat lifespan borrows that credential and releases
+    its own model client before the credential goes away.
+    """
+    async with AsyncExitStack() as resources:
+        await resources.enter_async_context(costs.cost_service_lifespan(app))
+        await resources.enter_async_context(chat.chat_service_lifespan(app))
+        yield
 
 
 def create_app() -> FastAPI:
@@ -14,7 +31,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Azure Cost Copilot API",
         version=__version__,
-        lifespan=costs.cost_service_lifespan,
+        lifespan=application_lifespan,
     )
     # add_middleware prepends, so CORSMiddleware must be added last to wrap the
     # error middleware and put CORS headers on sanitized 500 responses too.
@@ -29,6 +46,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
     app.include_router(health.router)
     app.include_router(costs.router)
+    app.include_router(chat.router)
     return app
 
 

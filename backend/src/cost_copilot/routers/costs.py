@@ -41,6 +41,9 @@ UPSTREAM_THROTTLED_DETAIL = "Cost data is rate limited; retry shortly"
 UPSTREAM_TIMEOUT_DETAIL = "Cost data request timed out"
 
 COST_SERVICE_STATE_ATTRIBUTE = "cost_service"
+# Published so other routers can borrow the one credential instead of creating
+# a second identity with its own transport and token cache.
+CREDENTIAL_STATE_ATTRIBUTE = "azure_credential"
 
 
 def build_cost_client(settings: Settings, *, acquire_token: TokenProvider) -> CostManagementClient:
@@ -57,10 +60,12 @@ def build_cost_client(settings: Settings, *, acquire_token: TokenProvider) -> Co
 async def cost_service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """One connection pool and one credential per application lifetime."""
     async with AsyncExitStack() as resources:
-        tokens = CredentialTokenProvider(DefaultAzureCredential())
+        credential = DefaultAzureCredential()
+        tokens = CredentialTokenProvider(credential)
         # Registered before the pool is built, so neither a failure building it nor a
         # failing pool shutdown can leave the credential's transport open.
         resources.push_async_callback(tokens.aclose)
+        setattr(app.state, CREDENTIAL_STATE_ATTRIBUTE, credential)
         client = build_cost_client(get_settings(), acquire_token=tokens)
         resources.push_async_callback(client.aclose)
         setattr(app.state, COST_SERVICE_STATE_ATTRIBUTE, CostService(client))
@@ -95,7 +100,7 @@ CostFilterParam = Annotated[CostFilter, Depends(build_filter)]
 CostServiceParam = Annotated[CostService, Depends(get_cost_service)]
 
 
-def _http_error_for(error: CostQueryError) -> HTTPException:
+def http_error_for(error: CostQueryError) -> HTTPException:
     if isinstance(error, CostThrottledError):
         return HTTPException(status_code=429, detail=UPSTREAM_THROTTLED_DETAIL)
     if isinstance(error, CostUpstreamTimeoutError):
@@ -110,7 +115,7 @@ async def _guarded[T](work: Awaitable[T]) -> T:
         return await work
     except CostQueryError as error:
         logger.warning("Cost query failed (%s)", type(error).__name__)
-        raise _http_error_for(error) from error
+        raise http_error_for(error) from error
 
 
 @router.get("/summary")

@@ -15,20 +15,47 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from time import monotonic
-from typing import Any, Protocol
+from typing import Any
 from uuid import UUID
 
 import httpx
-from anyio import to_thread
 
+from cost_copilot.clients.credentials import (
+    MANAGEMENT_SCOPE,
+    AccessTokenLike,
+    CredentialTokenProvider,
+    SupportsGetToken,
+    TokenProvider,
+)
 from cost_copilot.config import Settings
 from cost_copilot.models.cost import CostFilter, CostGrouping
 
 logger = logging.getLogger(__name__)
 
+# Re-exported so callers of this client keep one import site for its dependencies.
+__all__ = [
+    "MANAGEMENT_SCOPE",
+    "AccessTokenLike",
+    "CostAccessDeniedError",
+    "CostDataset",
+    "CostManagementClient",
+    "CostQueryError",
+    "CostRecord",
+    "CostResponseError",
+    "CostThrottledError",
+    "CostUpstreamError",
+    "CostUpstreamTimeoutError",
+    "CredentialTokenProvider",
+    "RequestedGrouping",
+    "SupportsGetToken",
+    "TokenProvider",
+    "build_query",
+    "parse_query_result",
+    "query_url",
+]
+
 API_VERSION = "2026-06-01"
 MANAGEMENT_HOST = "management.azure.com"
-MANAGEMENT_SCOPE = "https://management.azure.com/.default"
 NEXT_LINK_PREFIX = f"https://{MANAGEMENT_HOST}/"
 
 COST_AGGREGATION_ALIAS = "totalCost"
@@ -319,18 +346,6 @@ def parse_query_result(
     return CostDataset(currency=next(iter(currencies), None), records=tuple(records))
 
 
-class AccessTokenLike(Protocol):
-    @property
-    def token(self) -> str: ...
-
-
-class SupportsGetToken(Protocol):
-    def get_token(self, *scopes: str) -> AccessTokenLike: ...
-
-    def close(self) -> None: ...
-
-
-TokenProvider = Callable[[], Awaitable[str]]
 Sleeper = Callable[[float], Awaitable[None]]
 Clock = Callable[[], float]
 Jitter = Callable[[], float]
@@ -349,31 +364,6 @@ class _Deadline:
 
     def remaining(self) -> float:
         return self._expires_at - self._clock()
-
-
-class CredentialTokenProvider:
-    """Acquires an ARM token off the event loop.
-
-    The synchronous credential is deliberate: `azure.identity.aio` needs
-    azure-core's aiohttp transport, and aiohttp is not in this project's
-    lockfile, so the async credential would fail on its first token request.
-    Token acquisition is cached inside the credential and runs in a worker
-    thread, so the blocking call does not stall the loop.
-    """
-
-    def __init__(self, credential: SupportsGetToken, *, scope: str = MANAGEMENT_SCOPE) -> None:
-        self._credential = credential
-        self._scope = scope
-
-    def _token(self) -> str:
-        return self._credential.get_token(self._scope).token
-
-    async def __call__(self) -> str:
-        return await to_thread.run_sync(self._token)
-
-    async def aclose(self) -> None:
-        """Releases the credential's own transport; called by whoever created it."""
-        await to_thread.run_sync(self._credential.close)
 
 
 class CostManagementClient:
