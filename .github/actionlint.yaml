@@ -1,0 +1,20 @@
+# actionlint configuration.
+#
+# actionlint is not installed on developer laptops in this project, so the
+# workflows here are lint-checked by editors and by whatever runs actionlint in
+# CI. This file keeps the two behaving the same way.
+
+# Intentionally empty: every job in this repository runs on a GitHub-hosted
+# `ubuntu-latest` runner. An empty list means actionlint rejects any `runs-on:`
+# value it does not recognise, which is the failure mode we want - an
+# unrecognised runner label otherwise queues a job forever instead of failing.
+self-hosted-runner:
+  labels: []
+
+# `null` disables the configuration-variable check. The `vars.*` names used by
+# .github/workflows/infra.yml (AZURE_CLIENT_ID, AZURE_TENANT_ID,
+# AZURE_SUBSCRIPTION_ID, WORKSHOP_GROUP_OBJECT_ID) are created by
+# infra/scripts/bootstrap-oidc.sh against the GitHub API; actionlint cannot see
+# them and would otherwise report every one as undefined.
+config-variables: null
+
