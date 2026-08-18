@@ -1,0 +1,148 @@
+{
+  "_comment": "Synthetic Cost Management query responses. Every name and amount is invented; no real subscription data appears here.",
+  "groupedDaily": {
+    "id": "/subscriptions/439cf6ec-8907-40ee-bae2-7efd9656cd09/providers/Microsoft.CostManagement/Query/00000000-0000-0000-0000-000000000000",
+    "name": "00000000-0000-0000-0000-000000000000",
+    "type": "microsoft.costmanagement/Query",
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [
+        [12.5, 20260801, "Fabrikam Widget Service", "USD"],
+        [7.5, 20260801, "Fabrikam Ledger Service", "USD"],
+        [20.0, 20260802, "Fabrikam Widget Service", "USD"],
+        [5.0, 20260802, "Fabrikam Ledger Service", "USD"]
+      ],
+      "nextLink": null
+    }
+  },
+  "groupedDailyShuffledColumns": {
+    "properties": {
+      "columns": [
+        { "name": "Currency", "type": "String" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" }
+      ],
+      "rows": [
+        ["USD", "Fabrikam Widget Service", 12.5, 20260801],
+        ["USD", "Fabrikam Ledger Service", 7.5, 20260801],
+        ["USD", "Fabrikam Widget Service", 20.0, 20260802],
+        ["USD", "Fabrikam Ledger Service", 5.0, 20260802]
+      ],
+      "nextLink": null
+    }
+  },
+  "preTaxCostOffer": {
+    "properties": {
+      "columns": [
+        { "name": "ResourceGroupName", "type": "String" },
+        { "name": "BillingMonth", "type": "Number" },
+        { "name": "PreTaxCost", "type": "Number" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [
+        ["rg-fabrikam-dev", 20260801, 41.25, "EUR"],
+        ["rg-fabrikam-prod", 20260801, 108.75, "EUR"]
+      ],
+      "nextLink": null
+    }
+  },
+  "ungrouped": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [[45.0, "USD"]],
+      "nextLink": null
+    }
+  },
+  "emptyRows": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [],
+      "nextLink": null
+    }
+  },
+  "mixedCurrency": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [
+        [10.0, "Fabrikam Widget Service", "USD"],
+        [10.0, "Fabrikam Ledger Service", "EUR"]
+      ],
+      "nextLink": null
+    }
+  },
+  "pageOne": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [[12.5, 20260801, "Fabrikam Widget Service", "USD"]],
+      "nextLink": "https://management.azure.com/subscriptions/439cf6ec-8907-40ee-bae2-7efd9656cd09/providers/Microsoft.CostManagement/query?api-version=2026-06-01&%24skiptoken=FAKE-SKIPTOKEN"
+    }
+  },
+  "pageTwo": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [[7.5, 20260802, "Fabrikam Ledger Service", "USD"]],
+      "nextLink": null
+    }
+  },
+  "pageTwoDifferentSchema": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "ResourceGroupName", "type": "String" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [[7.5, 20260802, "rg-fabrikam-dev", "USD"]],
+      "nextLink": null
+    }
+  },
+  "noCurrencyColumn": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "ServiceName", "type": "String" }
+      ],
+      "rows": [[3.25, 20260801, "Fabrikam Widget Service"]],
+      "nextLink": null
+    }
+  },
+  "hostileNextLink": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [[1.0, "USD"]],
+      "nextLink": "https://management.azure.com.attacker.example/subscriptions/439cf6ec-8907-40ee-bae2-7efd9656cd09/providers/Microsoft.CostManagement/query?api-version=2026-06-01"
+    }
+  }
+}

@@ -499,7 +499,7 @@ Use `azure.identity.aio.DefaultAzureCredential` and HTTPX. Acquire a token for
 url = (
     "https://management.azure.com/subscriptions/"
     f"{settings.azure_subscription_id}/providers/Microsoft.CostManagement/query"
-    "?api-version=2025-03-01"
+    "?api-version=2026-06-01"
 )
 ```
 

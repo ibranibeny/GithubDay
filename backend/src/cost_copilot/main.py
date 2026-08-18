@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from cost_copilot import __version__
 from cost_copilot.config import get_settings
 from cost_copilot.errors import SafeErrorMiddleware, register_exception_handlers
-from cost_copilot.routers import health
+from cost_copilot.routers import costs, health
 
 
 def create_app() -> FastAPI:
@@ -24,6 +24,7 @@ def create_app() -> FastAPI:
     )
     register_exception_handlers(app)
     app.include_router(health.router)
+    app.include_router(costs.router)
     return app
 
 
