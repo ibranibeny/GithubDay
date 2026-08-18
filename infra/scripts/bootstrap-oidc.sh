@@ -139,6 +139,14 @@ ensure_service_principal() {
 #   * the app role -> the `roles` claim the FastAPI dependency checks;
 #   * the delegated scope -> what the SPA asks for as api://<apiClientId>/Cost.Read.
 #
+# The app role allows both the "User" and "Application" member types. "User"
+# covers the workshop group (its members get the role in their delegated tokens);
+# "Application" is what lets the OIDC deploy-test identity's service principal
+# hold the role, so the app-only token the live-api E2E suite mints with
+# `az account get-access-token --resource api://<apiClientId>` carries
+# `roles: ["Cost.Read"]`. Microsoft Graph rejects a service-principal
+# appRoleAssignment for a role that does not allow the Application member type.
+#
 # Microsoft Graph replaces a complex property wholesale on PATCH, so the whole
 # `api` object (scope plus pre-authorization) has to be sent in one request.
 # Pre-authorising the SPA removes the consent prompt without needing a tenant
@@ -157,7 +165,7 @@ configure_api_app() {
   "appRoles": [
     {
       "id": "${COST_READ_APP_ROLE_ID}",
-      "allowedMemberTypes": ["User"],
+      "allowedMemberTypes": ["User", "Application"],
       "displayName": "Cost.Read",
       "value": "Cost.Read",
       "description": "Read Azure cost data through the Cost Copilot API.",
@@ -244,28 +252,43 @@ redirect_uri_json() {
 }
 
 # ---------------------------------------------------------------------------
-# App role assignment for the workshop group
+# Cost.Read app role assignments
 # ---------------------------------------------------------------------------
 
-assign_group_to_cost_read() {
-  local group_object_id="$1" api_sp_object_id="$2" existing payload
+# assign_cost_read_app_role <graph-collection> <principal-object-id> <api-sp-object-id>
+#
+# Grant the API's Cost.Read app role to one principal. The request body is the
+# same whether the principal is a group or a service principal - only the
+# collection segment of the Graph URL differs (`groups` vs `servicePrincipals`) -
+# so a single function serves both callers and the Graph logic lives in exactly
+# one place. Idempotent: the existing assignment is looked up first.
+#
+#   * the workshop group is assigned through `groups`, so its members carry
+#     `roles: ["Cost.Read"]` in the delegated tokens the SPA obtains;
+#   * the OIDC deploy-test identity is assigned through `servicePrincipals`, so
+#     the app-only token it mints for api://<apiClientId> carries the same claim
+#     the backend's require_cost_reader dependency checks. That assignment only
+#     succeeds because the Cost.Read app role allows the "Application" member
+#     type (see configure_api_app).
+assign_cost_read_app_role() {
+  local collection="$1" principal_object_id="$2" api_sp_object_id="$3" existing payload
 
   existing="$(azval rest --method get \
-    --url "${GRAPH_BASE}/groups/${group_object_id}/appRoleAssignments?\$select=id,appRoleId,resourceId" \
+    --url "${GRAPH_BASE}/${collection}/${principal_object_id}/appRoleAssignments?\$select=id,appRoleId,resourceId" \
     --query "value[?appRoleId=='${COST_READ_APP_ROLE_ID}' && resourceId=='${api_sp_object_id}'] | [0].id" \
     --output tsv 2>/dev/null || true)"
   if [ -n "$existing" ] && [ "$existing" != "None" ]; then
-    ok "group ${group_object_id} already holds the Cost.Read app role"
+    ok "principal ${principal_object_id} already holds the Cost.Read app role"
     return 0
   fi
 
   payload="$(
     cat <<JSON
-{"principalId":"${group_object_id}","resourceId":"${api_sp_object_id}","appRoleId":"${COST_READ_APP_ROLE_ID}"}
+{"principalId":"${principal_object_id}","resourceId":"${api_sp_object_id}","appRoleId":"${COST_READ_APP_ROLE_ID}"}
 JSON
   )"
-  graph_request post "${GRAPH_BASE}/groups/${group_object_id}/appRoleAssignments" "$payload" >/dev/null
-  ok "assigned the Cost.Read app role to group ${group_object_id}"
+  graph_request post "${GRAPH_BASE}/${collection}/${principal_object_id}/appRoleAssignments" "$payload" >/dev/null
+  ok "assigned the Cost.Read app role to principal ${principal_object_id} (${collection})"
 }
 
 # ---------------------------------------------------------------------------
@@ -473,7 +496,7 @@ main() {
   fi
   configure_spa_app "$spa_client_id" "$api_client_id" "${redirect_uris[@]+"${redirect_uris[@]}"}"
   ensure_service_principal "$spa_client_id" >/dev/null
-  assign_group_to_cost_read "$WORKSHOP_GROUP_OBJECT_ID" "$api_sp_object_id"
+  assign_cost_read_app_role groups "$WORKSHOP_GROUP_OBJECT_ID" "$api_sp_object_id"
 
   # --- Deployment identities ---------------------------------------------
   ensure_resource_group "$shared_group" "$ACA_LOCATION"
@@ -507,6 +530,17 @@ main() {
     "github-branch-main" "repo:${repository}:ref:refs/heads/main"
   ensure_federated_credential "$TEST_IDENTITY_NAME" "$shared_group" \
     "github-pull-request" "repo:${repository}:pull_request"
+
+  # The live-api E2E suite runs under the deploy-test identity and calls the API
+  # with an app-only token for api://<apiClientId>. That token only carries
+  # `roles: ["Cost.Read"]` - which the backend requires - if this service
+  # principal holds the Cost.Read app role, so assign it here (idempotently),
+  # exactly as the workshop group is assigned above via the same helper.
+  if [ -n "$test_principal_id" ] && [ -n "$api_sp_object_id" ]; then
+    assign_cost_read_app_role servicePrincipals "$test_principal_id" "$api_sp_object_id"
+  else
+    warn "skipping the Cost.Read app role for the deploy-test identity: its service principal or the API service principal is not known yet"
+  fi
 
   if [ "$GRANT_DEPLOY_ROLES" = "1" ]; then
     local principal
