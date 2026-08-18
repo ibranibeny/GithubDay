@@ -58,7 +58,10 @@ case "$*" in
     emit "${FAKE_AZ_VERSION}"
     ;;
   "account show"*)
-    printf '%s\t%s\t%s\r\n' "${FAKE_TENANT_ID}" "${FAKE_SUBSCRIPTION_ID}" "stub@example.test"
+    # A JMESPath array projected to tsv is one value PER LINE, not a tab row.
+    emit "${FAKE_TENANT_ID}"
+    emit "${FAKE_SUBSCRIPTION_ID}"
+    emit "stub@example.test"
     ;;
   *managedEnvironments*)
     emit "East US"
