@@ -37,11 +37,13 @@ from openai import (
     RateLimitError,
 )
 from openai.types.responses import (
+    Response,
     ResponseInputItemParam,
     ResponseInputParam,
     ResponseTextConfigParam,
     ToolParam,
 )
+from openai.types.responses.response_usage import ResponseUsage
 from openai.types.shared_params import Reasoning
 from pydantic import ValidationError
 
@@ -214,7 +216,7 @@ class SupportsResponseCreation(Protocol):
         # The SDK's own per-request transport timeout, not a substitute for
         # `asyncio.timeout`: it is what bounds the HTTP call itself.
         timeout: float,  # noqa: ASYNC109
-    ) -> Any: ...
+    ) -> Response: ...
 
 
 class SupportsResponses(Protocol):
@@ -295,10 +297,10 @@ class FoundryChatClient:
         with dependency_span(FOUNDRY_DEPENDENCY) as call:
             call.record(model=self._model)
             response = await self._create(message)
-            call.record(**_usage_attributes(getattr(response, "usage", None)))
+            call.record(**_usage_attributes(response.usage))
             return parse_model_output(response.output_text or "")
 
-    async def _create(self, message: ResponseInputItemParam) -> Any:
+    async def _create(self, message: ResponseInputItemParam) -> Response:
         """One bounded request, with every provider failure mapped onto this module's errors."""
         try:
             return await self._client.responses.create(
@@ -330,7 +332,7 @@ class FoundryChatClient:
             ) from error
 
 
-def _usage_attributes(usage: Any) -> dict[str, int]:
+def _usage_attributes(usage: ResponseUsage | None) -> dict[str, int]:
     """Token counters only; a response without a usage block simply reports none."""
     counters = {}
     for name in ("input_tokens", "output_tokens", "total_tokens"):

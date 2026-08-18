@@ -125,6 +125,9 @@ def responses_payload(text: str) -> dict[str, Any]:
 class _FakeResponse:
     def __init__(self, output_text: str) -> None:
         self.output_text = output_text
+        # `Response.usage` is optional on the SDK type, so it is present and None
+        # rather than missing.
+        self.usage = None
 
 
 class _FakeResponses:

@@ -48,8 +48,10 @@ def http_exception_handler(request: Request, exc: Exception) -> Response:
 
 
 def unhandled_exception_handler(request: Request, exc: Exception) -> Response:
-    # The traceback belongs in the server log, never in the client response.
-    logger.exception("Unhandled error serving %s (%s)", request.url.path, type(exc).__name__)
+    # `setup_telemetry` exports this logger, and a traceback quotes the failing
+    # request line -- for an upstream call, the subscription-scoped ARM URL. The
+    # path and the exception type are enough to find the fault in the code.
+    logger.error("Unhandled error serving %s (%s)", request.url.path, type(exc).__name__)
     return JSONResponse(status_code=500, content={"detail": INTERNAL_ERROR_DETAIL})
 
 

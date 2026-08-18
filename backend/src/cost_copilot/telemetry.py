@@ -25,13 +25,14 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any
+from typing import Any, Final, Literal
 
 from azure.monitor.opentelemetry import configure_azure_monitor
 from opentelemetry import metrics, trace
 from opentelemetry.attributes import BoundedAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Span, SpanProcessor
+from opentelemetry.sdk.util import BoundedList
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
 from cost_copilot.config import Settings
@@ -45,6 +46,7 @@ __all__ = [
     "SERVICE_NAME",
     "UNKNOWN_VERSION",
     "DependencyCall",
+    "DependencyName",
     "SanitizingSpanProcessor",
     "dependency_span",
     "sanitize_attributes",
@@ -58,8 +60,11 @@ UNKNOWN_VERSION = "unknown"
 # A deployment stamps one of these; neither is a secret and both are plain text.
 VERSION_ENV_VARS = ("OTEL_SERVICE_VERSION", "GIT_SHA")
 
-COST_DEPENDENCY = "cost-management"
-FOUNDRY_DEPENDENCY = "foundry"
+# A span name is exported verbatim and is not covered by the attribute
+# allowlist, so the callers may only choose from this closed set.
+DependencyName = Literal["cost-management", "foundry"]
+COST_DEPENDENCY: Final[DependencyName] = "cost-management"
+FOUNDRY_DEPENDENCY: Final[DependencyName] = "foundry"
 DEPENDENCY_DURATION_METRIC = "cost_copilot.dependency.duration"
 
 OK_STATUS = "ok"
@@ -76,7 +81,6 @@ SAFE_ATTRIBUTE_NAMES = frozenset(
         "duration_ms",
         "row_count",
         "model",
-        "deployment",
         "input_tokens",
         "output_tokens",
         "total_tokens",
@@ -147,16 +151,35 @@ def sanitize_attributes(attributes: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class SanitizingSpanProcessor(SpanProcessor):
-    """Last line of defence: filters every span's attributes on the way out.
+    """Last line of defence: scrubs every span on the way out, whoever created it.
 
     `_on_ending` is the SDK's only hook that still receives a writable span;
-    `on_end` is handed an immutable `ReadableSpan`. The attribute container is
-    replaced wholesale because `BoundedAttributes` refuses deletion.
+    `on_end` is handed an immutable `ReadableSpan`. All three of a span's free-text
+    surfaces are handled, because the attribute allowlist alone does not cover the
+    other two:
+
+    * Attributes are replaced wholesale, because `BoundedAttributes` refuses
+      deletion. The replacement is frozen again, matching what `Span.end` does to
+      the original container immediately before calling this hook.
+    * Events are dropped. `Span.record_exception` writes the exception message and
+      the full stacktrace as event attributes, and neither the event name nor its
+      attributes pass through any allowlist. The instrumentor's exception
+      middleware records one whenever a response fails after it has started.
+    * The status description is dropped and only the code is kept: the SDK builds
+      that description from the exception's own text.
+
+    Every field is reached through `getattr`, so an unfamiliar span shape degrades
+    to "less scrubbing" rather than raising inside `Span.end`.
     """
 
     def _on_ending(self, span: Span) -> None:
         safe = sanitize_attributes(span.attributes or {})
-        span._attributes = BoundedAttributes(attributes=safe, immutable=False)
+        span._attributes = BoundedAttributes(attributes=safe, immutable=True)
+        if getattr(span, "_events", None) is not None:
+            span._events = BoundedList(0)
+        status = getattr(span, "_status", None)
+        if status is not None and getattr(status, "description", None) is not None:
+            span._status = Status(status.status_code)
 
 
 def _service_version() -> str:
@@ -193,7 +216,7 @@ def setup_telemetry(settings: Settings) -> bool:
 class DependencyCall:
     """The safe facts a client may attach to its dependency span."""
 
-    name: str
+    name: DependencyName
     status: str = OK_STATUS
     attributes: dict[str, Any] = field(default_factory=dict)
 
@@ -202,12 +225,12 @@ class DependencyCall:
 
 
 @contextmanager
-def dependency_span(name: str) -> Iterator[DependencyCall]:
+def dependency_span(name: DependencyName) -> Iterator[DependencyCall]:
     """Trace one upstream call, recording only attributes the allowlist admits.
 
     Exception recording and the SDK's automatic error status are both off: an
-    upstream error message can quote a URL carrying the subscription id, and span
-    events are not covered by the attribute sanitizer.
+    upstream error message can quote a URL carrying the subscription id. The
+    sanitizing processor drops both anyway, so this is belt and braces.
     """
     call = DependencyCall(name=name)
     started = monotonic()

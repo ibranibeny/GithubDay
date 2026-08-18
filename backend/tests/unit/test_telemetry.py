@@ -5,13 +5,18 @@ fake, and every span and metric is read back from the OpenTelemetry SDK's
 in-memory exporters, so the suite never opens a socket.
 """
 
+import ast
 import json
 from collections.abc import Iterator
-from typing import Any
+from pathlib import Path
+from typing import Any, get_args, get_type_hints
 
+import fastapi
 import httpx
 import pytest
+from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
+from openai.types.responses import Response
 from opentelemetry import metrics, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.metrics import MeterProvider
@@ -20,7 +25,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import SpanKind
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
 from constants import TEST_SUBSCRIPTION_ID
 from cost_copilot import main, telemetry
@@ -132,7 +137,6 @@ def test_every_named_sensitive_attribute_is_dropped(name: str) -> None:
         "duration_ms",
         "row_count",
         "model",
-        "deployment",
         "input_tokens",
         "output_tokens",
         "total_tokens",
@@ -143,6 +147,11 @@ def test_every_named_sensitive_attribute_is_dropped(name: str) -> None:
 )
 def test_safe_attributes_are_kept(name: str) -> None:
     assert sanitize_attributes({name: 1}) == {name: 1}
+
+
+def test_the_allowlist_carries_no_unwritten_deployment_alias() -> None:
+    """`model` already carries the deployment name, so a second alias is unreviewed surface."""
+    assert "deployment" not in SAFE_ATTRIBUTE_NAMES
 
 
 def test_unknown_attributes_are_dropped_even_when_they_look_harmless() -> None:
@@ -242,6 +251,64 @@ def test_the_processor_strips_attributes_that_bypassed_the_helper() -> None:
         span.set_attribute("http.url", LEAK_PROBE)
 
     assert attributes_of(finished()[0]) == {"dependency": "cost-management"}
+
+
+def test_the_processor_freezes_the_attributes_it_leaves_behind() -> None:
+    """The SDK freezes attributes inside `end()`; replacing them must not thaw them."""
+    tracer = trace.get_tracer("test")
+
+    with tracer.start_as_current_span("manual") as span:
+        span.set_attribute("dependency", "cost-management")
+
+    with pytest.raises(TypeError):
+        finished()[0]._attributes["prompt"] = LEAK_PROBE  # type: ignore[index]
+
+
+def test_the_processor_drops_every_span_event() -> None:
+    """Events carry the exception message and stacktrace the attribute filter never sees."""
+    tracer = trace.get_tracer("test")
+
+    with tracer.start_as_current_span("manual") as span:
+        span.add_event(
+            "exception",
+            {"exception.message": LEAK_PROBE, "exception.stacktrace": LEAK_PROBE},
+        )
+        span.add_event(LEAK_PROBE, {"dependency": "cost-management"})
+
+    ended = finished()[0]
+    assert ended.events == ()
+    assert LEAK_PROBE not in repr(ended.events)
+
+
+def test_the_processor_removes_a_status_description_and_keeps_the_code() -> None:
+    tracer = trace.get_tracer("test")
+
+    with tracer.start_as_current_span("manual") as span:
+        span.set_status(Status(StatusCode.ERROR, LEAK_PROBE))
+
+    status = finished()[0].status
+    assert status.status_code is StatusCode.ERROR
+    assert status.description is None
+
+
+def test_the_processor_leaves_a_description_free_status_alone() -> None:
+    tracer = trace.get_tracer("test")
+
+    with tracer.start_as_current_span("manual") as span:
+        span.set_status(Status(StatusCode.OK))
+
+    status = finished()[0].status
+    assert status.status_code is StatusCode.OK
+    assert status.description is None
+
+
+def test_the_processor_tolerates_a_span_without_sdk_internals() -> None:
+    """The hook is defensive: a span shape it does not recognise must not raise."""
+
+    class _Bare:
+        attributes: dict[str, Any] = {}
+
+    telemetry.SanitizingSpanProcessor()._on_ending(_Bare())  # type: ignore[arg-type]
 
 
 # --- cost dependency spans --------------------------------------------------
@@ -377,8 +444,9 @@ class _Usage:
 class _FakeResponse:
     def __init__(self, usage: object | None) -> None:
         self.output_text = json.dumps(MODEL_OUTPUT)
-        if usage is not None:
-            self.usage = usage
+        # `Response.usage` is optional on the SDK type, so absent usage is `None`
+        # rather than a missing attribute.
+        self.usage = usage
 
 
 class _FakeResponses:
@@ -444,6 +512,67 @@ def test_a_traced_request_carries_only_safe_attributes() -> None:
     assert "GET" in attributes.values()
 
 
+def test_a_successful_request_still_produces_a_traced_server_span() -> None:
+    """The event and status scrub must not cost normal requests their tracing."""
+    FastAPIInstrumentor().instrument(tracer_provider=trace.get_tracer_provider())
+    try:
+        response = TestClient(main.create_app()).get("/health/live")
+    finally:
+        FastAPIInstrumentor().uninstrument()
+
+    assert response.status_code == 200
+    span = finished(SpanKind.SERVER)[0]
+    assert span.name
+    assert attributes_of(span)
+    assert span.events == ()
+    assert span.status.status_code is StatusCode.UNSET
+    assert span.status.description is None
+
+
+def a_failing_app() -> fastapi.FastAPI:
+    """An app whose response fails *after* it has started.
+
+    `SafeErrorMiddleware` re-raises once the response has started, because the
+    status line is already on the wire. The instrumentor's own exception
+    middleware sits outside every user middleware, so it is the raise that puts
+    the exception message and stacktrace on the server span.
+    """
+    app = main.create_app()
+
+    @app.get("/stream")
+    def stream() -> StreamingResponse:
+        def body() -> Iterator[bytes]:
+            yield b"partial"
+            raise RuntimeError(f"GET {QUERY_URL} failed: {LEAK_PROBE}")
+
+        return StreamingResponse(body())
+
+    return app
+
+
+def test_a_failing_response_leaves_no_exception_text_on_the_server_span() -> None:
+    FastAPIInstrumentor().instrument(tracer_provider=trace.get_tracer_provider())
+    try:
+        TestClient(a_failing_app(), raise_server_exceptions=False).get("/stream")
+    finally:
+        FastAPIInstrumentor().uninstrument()
+
+    span = finished(SpanKind.SERVER)[0]
+    assert span.events == ()
+    assert span.status.description is None
+    assert set(attributes_of(span)) <= SAFE_ATTRIBUTE_NAMES
+    exported = json.dumps(
+        {
+            "name": span.name,
+            "attributes": attributes_of(span),
+            "status": [str(span.status.status_code), str(span.status.description)],
+            "events": repr(span.events),
+        }
+    )
+    assert LEAK_PROBE not in exported
+    assert TEST_SUBSCRIPTION_ID not in exported
+
+
 def test_the_app_is_built_only_after_telemetry_is_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -464,7 +593,148 @@ def test_the_app_is_built_only_after_telemetry_is_configured(
 
 
 def test_a_dependency_span_is_named_for_its_dependency() -> None:
-    with dependency_span("probe") as call:
+    with dependency_span(COST_DEPENDENCY) as call:
         call.record(row_count=1)
 
-    assert [span.name for span in finished(SpanKind.CLIENT)] == ["dependency probe"]
+    assert [span.name for span in finished(SpanKind.CLIENT)] == [f"dependency {COST_DEPENDENCY}"]
+
+
+def test_a_dependency_span_accepts_only_the_two_reviewed_names() -> None:
+    """The span name is exported verbatim, so it is a closed set rather than free text."""
+    hints = get_type_hints(dependency_span.__wrapped__)  # type: ignore[attr-defined]
+
+    assert set(get_args(hints["name"])) == {COST_DEPENDENCY, FOUNDRY_DEPENDENCY}
+
+
+def test_the_foundry_request_is_typed_against_the_sdk_response() -> None:
+    """Typed as `Any`, `output_text` and `usage` would go unchecked by mypy."""
+    assert get_type_hints(FoundryChatClient._create)["return"] is Response
+
+
+# --- logger discipline ------------------------------------------------------
+
+# `setup_telemetry` attaches the Azure Monitor handler to the `cost_copilot`
+# logger, so every record these call sites emit is exported. The checks below are
+# structural: they cannot prove a value is safe, but they do keep the two habits
+# that make the export safe — literal format strings and no tracebacks.
+SOURCE_ROOT = Path(telemetry.__file__).parent
+
+UNLOGGABLE_NAMES = frozenset(
+    {
+        "answer",
+        "body",
+        "connection_string",
+        "content",
+        "credential",
+        "dataset",
+        "detail",
+        "grounding",
+        "message",
+        "output_text",
+        "payload",
+        "prompt",
+        "question",
+        "records",
+        "response",
+        "rows",
+        "secret",
+        "subscription_id",
+        "target",
+        "tenant_id",
+        "text",
+        "token",
+        "url",
+        "usage",
+    }
+)
+
+
+def logger_calls() -> list[tuple[str, ast.Call]]:
+    calls = []
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+            ):
+                calls.append((f"{path.name}:{node.lineno}", node))
+    return calls
+
+
+def names_read_by(node: ast.expr) -> set[str]:
+    """Every identifier an argument reads, keeping only the tail of an attribute chain."""
+    nested = {id(inner.value) for inner in ast.walk(node) if isinstance(inner, ast.Attribute)}
+    return {
+        inner.attr if isinstance(inner, ast.Attribute) else inner.id
+        for inner in ast.walk(node)
+        if isinstance(inner, ast.Attribute | ast.Name) and id(inner) not in nested
+    }
+
+
+def test_the_source_has_logger_call_sites_to_police() -> None:
+    assert len(logger_calls()) >= 15
+
+
+def test_no_logger_call_exports_a_traceback() -> None:
+    """A traceback quotes the failing request line, and with it the ARM URL."""
+    offenders = [
+        where
+        for where, call in logger_calls()
+        if isinstance(call.func, ast.Attribute)
+        and (
+            call.func.attr == "exception"
+            or {keyword.arg for keyword in call.keywords} & {"exc_info", "stack_info"}
+        )
+    ]
+
+    assert offenders == []
+
+
+def test_every_log_message_is_a_literal_format_string() -> None:
+    offenders = [
+        where
+        for where, call in logger_calls()
+        if not (
+            call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        )
+    ]
+
+    assert offenders == []
+
+
+def test_no_logger_argument_reads_upstream_text() -> None:
+    offenders = []
+    for where, call in logger_calls():
+        for argument in call.args[1:]:
+            leaked = {name.casefold() for name in names_read_by(argument)} & UNLOGGABLE_NAMES
+            if leaked:
+                offenders.append(f"{where} reads {sorted(leaked)}")
+            if any(
+                isinstance(inner, ast.JoinedStr)
+                or (isinstance(inner, ast.Call) and getattr(inner.func, "id", None) == "str")
+                for inner in ast.walk(argument)
+            ):
+                offenders.append(f"{where} interpolates an unbounded value")
+
+    assert offenders == []
+
+
+def test_every_module_logs_through_its_own_dotted_logger() -> None:
+    """A logger named outside the `cost_copilot` tree would skip both the export and
+    the scan above."""
+    offenders = []
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "getLogger"
+                and not (len(node.args) == 1 and getattr(node.args[0], "id", None) == "__name__")
+            ):
+                offenders.append(f"{path.name}:{node.lineno}")
+
+    assert offenders == []
