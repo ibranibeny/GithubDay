@@ -9,10 +9,13 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint .",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "lint": "eslint . && npm run lint:e2e",
+    "lint:e2e": "cd .. && eslint tests/e2e",
     "lint:lockfile": "node scripts/check-lockfile.mjs",
-    "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format": "prettier --write . && cd .. && prettier --write --config frontend/.prettierrc tests/e2e eslint.config.mjs",
+    "format:check": "prettier --check . && cd .. && prettier --check --config frontend/.prettierrc tests/e2e eslint.config.mjs"
   },
   "engines": {
     "node": ">=22.12"
