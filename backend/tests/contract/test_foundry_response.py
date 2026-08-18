@@ -7,12 +7,16 @@ installed `openai` SDK's Responses API shape (`text.format` structured outputs,
 """
 
 import json
+import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 
 import httpx
 import pytest
 import respx
+from azure.core.exceptions import ClientAuthenticationError
+from azure.identity import CredentialUnavailableError
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -22,13 +26,21 @@ from openai import (
 )
 
 from constants import TEST_FOUNDRY_ENDPOINT
+from cost_copilot.clients.credentials import (
+    CredentialAcquisitionError,
+    CredentialTimeoutError,
+    CredentialTokenProvider,
+)
 from cost_copilot.clients.foundry import (
     GROUNDING_INSTRUCTIONS,
     MAX_OUTPUT_TOKENS,
+    MAX_REQUEST_CHARS,
     REQUEST_TIMEOUT_SECONDS,
     RESPONSE_SCHEMA,
     RESPONSE_SCHEMA_NAME,
     FoundryChatClient,
+    FoundryConfigurationError,
+    FoundryError,
     FoundryResponseError,
     FoundryThrottledError,
     FoundryTimeoutError,
@@ -69,6 +81,23 @@ VALID_OUTPUT: dict[str, Any] = {
 }
 
 LEAK_PROBE = "sk-live-abcdef principal 9f3c at contoso-internal.example"
+# Small enough that a regression is measured in milliseconds, not in the real bound.
+TEST_BOUND_SECONDS = 0.05
+
+
+class _ParkedCredential:
+    """Stands in for an identity endpoint that accepts the call and never answers."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+
+    def get_token(self, *scopes: str) -> Any:
+        # Bounded so a regression fails the suite instead of hanging it.
+        self.release.wait(timeout=10.0)
+        raise AssertionError("the parked credential is never released before the bound")
+
+    def close(self) -> None:  # pragma: no cover - the provider borrows, it does not own
+        raise AssertionError("the parked credential is never closed by the provider")
 
 
 def responses_payload(text: str) -> dict[str, Any]:
@@ -322,14 +351,133 @@ async def test_the_built_client_awaits_the_async_token_provider() -> None:
     assert route.calls.last.request.headers["authorization"] == "Bearer stub-token"
 
 
-def test_the_built_client_targets_the_configured_endpoint_and_deployment() -> None:
+async def test_the_built_client_targets_the_configured_endpoint_and_deployment() -> None:
     settings = get_settings()
 
     async def acquire_token() -> str:
         return "stub-token"  # noqa: S105  # not a credential, only a stub value
 
     client = build_foundry_client(settings, acquire_token=acquire_token)
+    try:
+        assert isinstance(client.raw_client, AsyncOpenAI)
+        assert str(client.raw_client.base_url) == str(settings.foundry_endpoint)
+        assert client.model == settings.foundry_deployment
+    finally:
+        # The real SDK client owns an httpx pool, so it is released even here.
+        await client.aclose()
 
-    assert isinstance(client.raw_client, AsyncOpenAI)
-    assert str(client.raw_client.base_url) == str(settings.foundry_endpoint)
-    assert client.model == settings.foundry_deployment
+
+# --- credential failures ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        pytest.param(ClientAuthenticationError(LEAK_PROBE), id="client-authentication"),
+        pytest.param(CredentialUnavailableError(LEAK_PROBE), id="credential-unavailable"),
+        pytest.param(CredentialAcquisitionError(LEAK_PROBE), id="acquisition-failed"),
+        pytest.param(CredentialTimeoutError(LEAK_PROBE), id="acquisition-timed-out"),
+    ],
+)
+async def test_a_credential_failure_maps_to_a_typed_foundry_error(raised: Exception) -> None:
+    """The token is awaited inside `responses.create`, so it fails outside every OpenAI type."""
+    client, _ = build_client(raised)
+
+    with pytest.raises(FoundryUnavailableError) as caught:
+        await client.respond(prompt="why?", grounding=GROUNDING)
+
+    assert isinstance(caught.value, FoundryError)
+    assert "contoso-internal" not in str(caught.value)
+    assert "sk-live" not in str(caught.value)
+
+
+async def test_a_token_provider_failure_inside_the_sdk_never_escapes_untyped() -> None:
+    """Drives the real SDK path: the provider raises where the SDK awaits it."""
+
+    async def acquire_token() -> str:
+        raise ClientAuthenticationError(LEAK_PROBE)
+
+    client = build_foundry_client(get_settings(), acquire_token=acquire_token)
+    try:
+        with respx.mock(assert_all_called=False) as router:
+            route = router.post(f"{TEST_FOUNDRY_ENDPOINT}responses")
+            with pytest.raises(FoundryUnavailableError) as caught:
+                await client.respond(prompt="why?", grounding=GROUNDING)
+    finally:
+        await client.aclose()
+
+    assert route.call_count == 0
+    assert "contoso-internal" not in str(caught.value)
+
+
+async def test_a_parked_credential_is_refused_within_the_acquisition_bound() -> None:
+    """A hung identity endpoint fails the chat call quickly instead of burning the budget."""
+    credential = _ParkedCredential()
+    provider = CredentialTokenProvider(credential, timeout=TEST_BOUND_SECONDS)
+    client = build_foundry_client(get_settings(), acquire_token=provider)
+    started = time.monotonic()
+
+    try:
+        with respx.mock(assert_all_called=False) as router:
+            route = router.post(f"{TEST_FOUNDRY_ENDPOINT}responses")
+            with pytest.raises(FoundryUnavailableError):
+                await client.respond(prompt="why?", grounding=GROUNDING)
+        elapsed = time.monotonic() - started
+    finally:
+        credential.release.set()
+        await client.aclose()
+
+    assert route.call_count == 0
+    # Far below the credential's own park, so an unbounded acquisition fails here.
+    assert elapsed < 5.0
+
+
+# --- permanent configuration faults ----------------------------------------
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+async def test_a_non_throttling_client_error_is_reported_as_a_configuration_fault(
+    status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 4xx is a permanent fault: silent degradation must stay alertable."""
+    client, _ = build_client(status_error(status))
+
+    with caplog.at_level("ERROR"), pytest.raises(FoundryConfigurationError) as caught:
+        await client.respond(prompt="why?", grounding=GROUNDING)
+
+    assert isinstance(caught.value, FoundryError)
+    assert str(status) in caplog.text
+    assert "contoso-internal" not in caplog.text
+    assert "sk-live" not in caplog.text
+    assert "contoso-internal" not in str(caught.value)
+
+
+# --- request bounds --------------------------------------------------------
+
+
+async def test_an_oversized_request_is_refused_before_it_is_sent() -> None:
+    client, fake = build_client(_FakeResponse(json.dumps(VALID_OUTPUT)))
+
+    with pytest.raises(FoundryConfigurationError):
+        await client.respond(prompt="x" * (MAX_REQUEST_CHARS + 1), grounding=GROUNDING)
+
+    assert fake.responses.calls == []
+
+
+# --- lifecycle -------------------------------------------------------------
+
+
+async def test_a_failing_close_still_marks_the_client_closed() -> None:
+    """Otherwise a retried shutdown would close a pool the client no longer owns."""
+
+    class _FailingClose(_FakeOpenAI):
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("pool shutdown failed")
+
+    client = FoundryChatClient(client=_FailingClose(None), model="gpt-5.4-mini", owns_client=True)
+
+    with pytest.raises(RuntimeError, match="pool shutdown failed"):
+        await client.aclose()
+
+    assert client.is_closed

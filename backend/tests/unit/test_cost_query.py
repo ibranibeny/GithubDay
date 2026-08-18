@@ -4,6 +4,7 @@ import asyncio
 import threading
 from collections.abc import AsyncIterator
 from datetime import date
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -28,6 +29,7 @@ from cost_copilot.clients.cost_management import (
     build_query,
     query_url,
 )
+from cost_copilot.clients.credentials import CredentialAcquisitionError, CredentialTimeoutError
 from cost_copilot.config import get_settings
 from cost_copilot.models.cost import CostFilter, CostGrouping, CostMetric
 from fixture_data import cost_fixture
@@ -37,6 +39,9 @@ QUERY_URL = (
     f"/providers/Microsoft.CostManagement/query?api-version={API_VERSION}"
 )
 ACCESS_TOKEN = "fake-access-token"  # noqa: S105  # not a credential, only a stub value
+LEAK_PROBE = "sk-live-abcdef principal 9f3c at contoso-internal.example"
+# Small enough that a regression is measured in milliseconds, not in the real bound.
+TEST_BOUND_SECONDS = 0.05
 
 
 def a_filter(**overrides: object) -> CostFilter:
@@ -721,6 +726,10 @@ class _BlockingCredential:
         raise AssertionError("the blocking credential is never closed by the provider")
 
 
+class _ParkedCredential(_BlockingCredential):
+    """Never released before the bound, so only the bound can end the acquisition."""
+
+
 async def test_a_cancelled_token_acquisition_returns_control_immediately() -> None:
     """Pins the worker-thread behaviour the query budget rests on.
 
@@ -738,6 +747,79 @@ async def test_a_cancelled_token_acquisition_returns_control_immediately() -> No
         assert not credential.returned.is_set()
     finally:
         credential.release.set()
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        pytest.param(
+            CredentialAcquisitionError(LEAK_PROBE), CostAccessDeniedError, id="acquisition-failed"
+        ),
+        pytest.param(
+            CredentialTimeoutError(LEAK_PROBE), CostUpstreamTimeoutError, id="acquisition-timed-out"
+        ),
+    ],
+)
+@respx.mock
+async def test_a_credential_failure_is_reported_as_a_typed_cost_error(
+    raised: Exception, expected: type[Exception]
+) -> None:
+    """A credential fault must not reach the caller as an unhandled 500."""
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
+
+    async def failing_token() -> str:
+        raise raised
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, acquire_token=failing_token)
+
+        with pytest.raises(expected) as caught:
+            await client.run_query(a_filter(), "Daily")
+
+    assert "contoso-internal" not in str(caught.value)
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+async def test_a_parked_credential_is_refused_within_the_provider_bound() -> None:
+    """The provider's own bound applies inside the cost client's lock: no deadlock, no hang."""
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
+    credential = _ParkedCredential()
+    provider = CredentialTokenProvider(credential, timeout=TEST_BOUND_SECONDS)
+    started = monotonic()
+
+    try:
+        async with httpx.AsyncClient() as http_client:
+            client = a_client(http_client, acquire_token=provider)
+
+            with pytest.raises(CostUpstreamTimeoutError):
+                await client.run_query(a_filter(), "Daily")
+        elapsed = monotonic() - started
+    finally:
+        credential.release.set()
+
+    # Far below the credential's own park, so an unbounded acquisition fails here.
+    assert elapsed < 5.0
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+async def test_clients_sharing_one_provider_make_progress_under_contention() -> None:
+    """No deadlock: the cost lock is always taken before the provider's, never the reverse."""
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
+    credential = _StubCredential()
+    provider = CredentialTokenProvider(credential)
+
+    async with httpx.AsyncClient() as http_client:
+        clients = [a_client(http_client, acquire_token=provider) for _ in range(3)]
+
+        async with asyncio.timeout(10.0):
+            results = await asyncio.gather(
+                *(client.run_query(a_filter(), "Daily") for client in clients)
+            )
+
+    assert len(results) == 3
+    assert all(result.records for result in results)
 
 
 @respx.mock

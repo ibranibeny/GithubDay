@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from cost_copilot.clients.cost_management import CostAccessDeniedError, CostUpstreamTimeoutError
 from cost_copilot.clients.foundry import (
@@ -303,3 +304,25 @@ async def test_a_request_without_filters_is_refused_before_any_query() -> None:
 
     assert cost.calls == []
     assert foundry.awaited == 0
+
+
+async def test_the_published_evidence_repeats_the_queried_figures_not_the_model_echo() -> None:
+    """Citations are matched at published precision, so the queried row is the one republished."""
+    drifted = WIDGET_EVIDENCE.model_copy(update={"amount": 32.504})
+    service, _, _ = build_service(
+        foundry=StubFoundry(model_answer(evidence=[drifted, WIDGET_EVIDENCE]))
+    )
+
+    response = await service.answer(request())
+
+    assert response.explanation_available is True
+    assert [item.amount for item in response.evidence] == [32.5, 32.5]
+    assert response.evidence == [WIDGET_EVIDENCE, WIDGET_EVIDENCE]
+
+
+def test_the_chat_filter_is_immutable() -> None:
+    """Inherited from CostFilter: a filter is shared with the cost query, never edited."""
+    assert ChatCostFilter.model_config["frozen"] is True
+
+    with pytest.raises(ValidationError):
+        FILTERS.start = date(2020, 1, 1)

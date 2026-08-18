@@ -2,9 +2,12 @@
 
 Two rules hold everywhere in this module. The model is never consulted unless a
 real cost query succeeded first, so a failed query can never be papered over by
-a plausible-sounding answer. And nothing the model returns is published unless
-every figure and every command it produced is present in that queried data, so
-an unsupported claim is dropped rather than forwarded.
+a plausible-sounding answer. And an answer is published only if every evidence
+entry and every command it produced matches the queried data; what is then
+published as evidence is the queried row itself, never the model's copy of it.
+
+The answer *prose* is not verified figure by figure: it is bounded, stripped to
+plain text, and published alongside evidence a reader can check it against.
 """
 
 import logging
@@ -115,7 +118,7 @@ def _action_is_supported(
 
 
 class ChatService:
-    """Answers cost questions, or declines to, but never invents."""
+    """Answers cost questions from queried figures, or declines to answer at all."""
 
     def __init__(self, cost: CostReporter, foundry: FoundryResponder) -> None:
         self.cost = cost
@@ -142,7 +145,7 @@ class ChatService:
 
 def _required_filters(request: ChatRequest) -> ChatCostFilter:
     """Guards the programmatic path; the HTTP boundary already rejects a missing filter."""
-    filters = getattr(request, "filters", None)
+    filters = request.filters
     if not isinstance(filters, ChatCostFilter):
         raise ChatFiltersRequiredError("chat requires the active dashboard filters")
     return filters
@@ -151,7 +154,7 @@ def _required_filters(request: ChatRequest) -> ChatCostFilter:
 def _grounded_answer(
     proposed: ModelAnswer, evidence: Sequence[Evidence], filters: ChatCostFilter
 ) -> ChatResponse | None:
-    """Return the answer only if every claim in it is backed by `evidence`."""
+    """Return the answer only if every citation and command in it is backed by `evidence`."""
     answer = plain_text(proposed.answer)
     if not answer:
         logger.warning("Discarding a model answer with no readable text")
@@ -161,8 +164,9 @@ def _grounded_answer(
         logger.warning("Discarding a model answer that cites no evidence")
         return None
 
-    supported = {_citation_key(item) for item in evidence}
-    if any(_citation_key(item) not in supported for item in proposed.evidence):
+    queried = {_citation_key(item): item for item in evidence}
+    cited = [queried.get(_citation_key(item)) for item in proposed.evidence]
+    if any(item is None for item in cited):
         logger.warning("Discarding a model answer that cites figures outside the cost data")
         return None
 
@@ -175,9 +179,10 @@ def _grounded_answer(
 
     return ChatResponse(
         answer=answer,
-        # The citations are a validated subset of the queried data, so publishing
-        # them keeps the answer linkable without widening what was verified.
-        evidence=list(proposed.evidence),
+        # The queried rows are republished, not the model's copies of them: a
+        # citation matches at published precision, so an echoed amount could
+        # otherwise differ from the queried one by up to that tolerance.
+        evidence=[item for item in cited if item is not None],
         chart_actions=list(proposed.chart_actions),
         explanation_available=True,
     )

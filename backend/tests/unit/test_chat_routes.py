@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 import respx
+from azure.core.exceptions import ClientAuthenticationError
+from azure.identity import CredentialUnavailableError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -16,6 +18,7 @@ from cost_copilot.clients.cost_management import (
     CostRecord,
     CostThrottledError,
 )
+from cost_copilot.clients.credentials import CredentialAcquisitionError, CredentialTimeoutError
 from cost_copilot.clients.foundry import FoundryChatClient, FoundryTimeoutError
 from cost_copilot.main import create_app
 from cost_copilot.models.chat import ChartAction, ChartActionKind, Evidence, ModelAnswer
@@ -184,6 +187,53 @@ def test_a_model_timeout_still_returns_the_cost_evidence() -> None:
     assert body["explanationAvailable"] is False
     assert body["answer"] == EXPLANATION_UNAVAILABLE_ANSWER
     assert body["evidence"][0]["amount"] == 32.5
+
+
+class _RaisingResponses:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def create(self, **kwargs: Any) -> Any:
+        # The SDK awaits the token provider inside this call, so a credential
+        # failure surfaces exactly here.
+        raise self._error
+
+
+class _RaisingOpenAI:
+    """Stands in for AsyncOpenAI whose awaited token provider fails."""
+
+    def __init__(self, error: Exception) -> None:
+        self.responses = _RaisingResponses(error)
+
+    async def close(self) -> None: ...
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(ClientAuthenticationError(LEAK_PROBE), id="client-authentication"),
+        pytest.param(CredentialUnavailableError(LEAK_PROBE), id="credential-unavailable"),
+        pytest.param(CredentialAcquisitionError(LEAK_PROBE), id="acquisition-failed"),
+        pytest.param(CredentialTimeoutError(LEAK_PROBE), id="acquisition-timed-out"),
+    ],
+)
+def test_a_credential_failure_keeps_the_cost_data_and_never_becomes_a_500(
+    failure: Exception,
+) -> None:
+    """A credential fault is not an OpenAI error, so it must still fail closed, not open."""
+    responder = FoundryChatClient(client=_RaisingOpenAI(failure), model="gpt-5.4-mini")
+    app = create_app()
+    app.dependency_overrides[verify_token] = lambda: CLAIMS
+    app.dependency_overrides[get_chat_service] = lambda: ChatService(StubCostReporter(), responder)
+
+    response = TestClient(app).post("/api/chat", json=BODY)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["explanationAvailable"] is False
+    assert body["answer"] == EXPLANATION_UNAVAILABLE_ANSWER
+    assert body["evidence"][0]["amount"] == 32.5
+    assert "contoso-internal" not in response.text
 
 
 @pytest.mark.parametrize(

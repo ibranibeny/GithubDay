@@ -23,6 +23,8 @@ import httpx
 from cost_copilot.clients.credentials import (
     MANAGEMENT_SCOPE,
     AccessTokenLike,
+    CredentialError,
+    CredentialTimeoutError,
     CredentialTokenProvider,
     SupportsGetToken,
     TokenProvider,
@@ -45,6 +47,8 @@ __all__ = [
     "CostThrottledError",
     "CostUpstreamError",
     "CostUpstreamTimeoutError",
+    "CredentialError",
+    "CredentialTimeoutError",
     "CredentialTokenProvider",
     "RequestedGrouping",
     "SupportsGetToken",
@@ -413,12 +417,18 @@ class CostManagementClient:
         try:
             # Single-flight inside the budget: a cold credential is asked once while
             # other callers wait, and a stuck one cannot hold the lock past the deadline.
+            # The provider applies its own, shorter bound and its own lock; the two
+            # locks are always taken in this order and never the reverse, so the
+            # nesting cannot deadlock.
             async with asyncio.timeout(remaining), self._token_lock:
                 return f"Bearer {await self._acquire_token()}"
-        except TimeoutError as error:
+        except (TimeoutError, CredentialTimeoutError) as error:
             raise CostUpstreamTimeoutError(
                 "Cost Management did not answer within the query budget"
             ) from error
+        except CredentialError as error:
+            # The provider already logged the failure by type and stripped its detail.
+            raise CostAccessDeniedError("Cost Management rejected the API identity") from error
 
     async def _fetch_all_pages(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
         deadline = _Deadline(self._clock, QUERY_DEADLINE_SECONDS)

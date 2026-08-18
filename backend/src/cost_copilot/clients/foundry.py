@@ -16,13 +16,18 @@ Contract this module is written against, verified against the installed
   exposes as `ResponseFormatTextJSONSchemaConfigParam`. No `json_object`
   fallback is needed on this version.
 * Verbosity lives on `text.verbosity`; reasoning effort on `reasoning.effort`.
+* Because the token is awaited *inside* `responses.create`, a credential failure
+  surfaces from that call as an exception the OpenAI SDK never wraps. It is
+  therefore mapped here explicitly: otherwise it would miss every `except` below
+  and escape this module's error contract as an unhandled 500.
 """
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
 
+from azure.core.exceptions import ClientAuthenticationError
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -31,9 +36,20 @@ from openai import (
     OpenAIError,
     RateLimitError,
 )
+from openai.types.responses import (
+    ResponseInputItemParam,
+    ResponseInputParam,
+    ResponseTextConfigParam,
+    ToolParam,
+)
+from openai.types.shared_params import Reasoning
 from pydantic import ValidationError
 
-from cost_copilot.clients.credentials import COGNITIVE_SERVICES_SCOPE, TokenProvider
+from cost_copilot.clients.credentials import (
+    COGNITIVE_SERVICES_SCOPE,
+    CredentialError,
+    TokenProvider,
+)
 from cost_copilot.config import Settings
 from cost_copilot.models.chat import (
     MAX_ANSWER_LENGTH,
@@ -51,10 +67,12 @@ __all__ = [
     "COGNITIVE_SERVICES_SCOPE",
     "GROUNDING_INSTRUCTIONS",
     "MAX_OUTPUT_TOKENS",
+    "MAX_REQUEST_CHARS",
     "REQUEST_TIMEOUT_SECONDS",
     "RESPONSE_SCHEMA",
     "RESPONSE_SCHEMA_NAME",
     "FoundryChatClient",
+    "FoundryConfigurationError",
     "FoundryError",
     "FoundryResponseError",
     "FoundryThrottledError",
@@ -68,6 +86,12 @@ REQUEST_TIMEOUT_SECONDS = 45.0
 MAX_OUTPUT_TOKENS = 1200
 MAX_RETRIES = 0  # retries are the caller's decision; a chat request must not stack timeouts
 RESPONSE_SCHEMA_NAME = "cost_explanation"
+# Defence in depth. The HTTP boundary already caps the prompt and the grounding
+# is built from this API's own query result, so exceeding this is a fault in a
+# caller rather than something a user can provoke.
+MAX_REQUEST_CHARS = 64_000
+# A provider error code is a short machine token, but it is still provider text.
+MAX_LOGGED_CODE_CHARS = 64
 
 GROUNDING_INSTRUCTIONS = (
     "You explain Azure cost data. The user message is JSON with a 'question' field "
@@ -130,7 +154,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     },
 }
 
-TEXT_CONFIG: dict[str, Any] = {
+TEXT_CONFIG: ResponseTextConfigParam = {
     "verbosity": "low",
     "format": {
         "type": "json_schema",
@@ -139,7 +163,9 @@ TEXT_CONFIG: dict[str, Any] = {
         "schema": RESPONSE_SCHEMA,
     },
 }
-REASONING_CONFIG: dict[str, Any] = {"effort": "low"}
+REASONING_CONFIG: Reasoning = {"effort": "low"}
+# No tool is offered, so web search and every other hosted tool is unreachable.
+NO_TOOLS: Iterable[ToolParam] = []
 
 
 class FoundryError(Exception):
@@ -155,18 +181,46 @@ class FoundryThrottledError(FoundryError):
 
 
 class FoundryUnavailableError(FoundryError):
-    """The deployment could not be reached or returned an unusable status."""
+    """The deployment could not be reached, authenticated, or returned an unusable status."""
+
+
+class FoundryConfigurationError(FoundryError):
+    """The deployment rejected the request itself, so every later one fails the same way.
+
+    Distinct from `FoundryUnavailableError` because it is permanent: a rejected
+    schema keyword or a wrong endpoint degrades every answer silently otherwise.
+    """
 
 
 class FoundryResponseError(FoundryError):
     """The model answered with output this client cannot trust."""
 
 
+class SupportsResponseCreation(Protocol):
+    """The one Responses API call this client makes, typed against the SDK's params."""
+
+    async def create(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        input: ResponseInputParam,
+        text: ResponseTextConfigParam,
+        reasoning: Reasoning,
+        tools: Iterable[ToolParam],
+        max_output_tokens: int,
+        store: bool,
+        # The SDK's own per-request transport timeout, not a substitute for
+        # `asyncio.timeout`: it is what bounds the HTTP call itself.
+        timeout: float,  # noqa: ASYNC109
+    ) -> Any: ...
+
+
 class SupportsResponses(Protocol):
     """The slice of `AsyncOpenAI` this client uses, so a fake can stand in."""
 
     @property
-    def responses(self) -> Any: ...
+    def responses(self) -> SupportsResponseCreation: ...
 
     async def close(self) -> None: ...
 
@@ -219,31 +273,30 @@ class FoundryChatClient:
 
     async def aclose(self) -> None:
         """Closes only what this client owns, so a caller's pool is never double-closed."""
-        if self._owns_client:
-            await self._client.close()
-        self._closed = True
+        try:
+            if self._owns_client:
+                await self._client.close()
+        finally:
+            # Recorded even if the pool's own shutdown failed: the client is spent
+            # either way, and a retried close would release a pool it no longer owns.
+            self._closed = True
 
     async def respond(self, *, prompt: str, grounding: Mapping[str, Any]) -> ModelAnswer:
         """Ask the deployment to explain `grounding`, and return only a parsed answer."""
+        content = json.dumps({"question": prompt, "costData": grounding}, default=str)
+        if len(content) > MAX_REQUEST_CHARS:
+            raise FoundryConfigurationError("The grounded request is larger than this client sends")
+        # The question and the data both travel as a JSON value in a user message,
+        # so neither can be read as a system instruction.
+        message: ResponseInputItemParam = {"role": "user", "content": content}
         try:
             response = await self._client.responses.create(
                 model=self._model,
                 instructions=GROUNDING_INSTRUCTIONS,
-                # The question and the data both travel as a JSON value in a user
-                # message, so neither can be read as a system instruction.
-                input=[
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {"question": prompt, "costData": grounding}, default=str
-                        ),
-                    }
-                ],
+                input=[message],
                 text=TEXT_CONFIG,
                 reasoning=REASONING_CONFIG,
-                # No tool is offered, so web search and every other hosted tool is
-                # unreachable from this call.
-                tools=[],
+                tools=NO_TOOLS,
                 max_output_tokens=MAX_OUTPUT_TOKENS,
                 store=False,
                 timeout=self._timeout,
@@ -253,14 +306,37 @@ class FoundryChatClient:
         except RateLimitError as error:
             raise FoundryThrottledError("The model deployment is rate limited") from error
         except APIStatusError as error:
-            # Only the status is logged: a provider error body can quote the prompt.
-            logger.warning("Foundry returned status %s", error.status_code)
-            raise FoundryUnavailableError("The model deployment is unavailable") from error
+            raise _status_failure(error) from error
         except (APIConnectionError, OpenAIError) as error:
             logger.warning("Foundry request failed (%s)", type(error).__name__)
             raise FoundryUnavailableError("The model deployment could not be reached") from error
+        except (CredentialError, ClientAuthenticationError) as error:
+            # The token is awaited inside `create`, so this is the only place a
+            # credential failure can be caught before it escapes untyped.
+            logger.warning("Foundry token acquisition failed (%s)", type(error).__name__)
+            raise FoundryUnavailableError(
+                "The model deployment could not be authenticated"
+            ) from error
 
         return parse_model_output(response.output_text or "")
+
+
+def _status_failure(error: APIStatusError) -> FoundryError:
+    """A 4xx is permanent and alertable; a 5xx is transient. Neither quotes the body."""
+    if 400 <= error.status_code < 500:
+        # Only the status and the provider's own short codes are logged: an error
+        # body can quote the prompt.
+        logger.error(
+            "Foundry rejected the request with status %s (code=%.*s, type=%.*s)",
+            error.status_code,
+            MAX_LOGGED_CODE_CHARS,
+            error.code or "unknown",
+            MAX_LOGGED_CODE_CHARS,
+            error.type or "unknown",
+        )
+        return FoundryConfigurationError("The model deployment rejected this request")
+    logger.warning("Foundry returned status %s", error.status_code)
+    return FoundryUnavailableError("The model deployment is unavailable")
 
 
 def build_foundry_client(settings: Settings, *, acquire_token: TokenProvider) -> FoundryChatClient:
