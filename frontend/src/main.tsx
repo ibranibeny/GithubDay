@@ -2,9 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
+import { AppShell } from "./app/AppShell";
 import { RuntimeConfigError, getRuntimeConfig } from "./app/runtime-config";
 import { AuthGate } from "./auth/AuthGate";
 import { buildApiScope, getMsalInstance } from "./auth/msal";
+import { CostDashboard } from "./features/dashboard/CostDashboard";
+import "./styles/tokens.css";
 
 const container = document.getElementById("root");
 if (!container) {
@@ -21,7 +24,11 @@ try {
     <StrictMode>
       <QueryClientProvider client={queryClient}>
         <AuthGate instance={getMsalInstance(config)} scopes={[buildApiScope(config)]}>
-          <main>Azure Cost Copilot</main>
+          <AppShell>
+            {/* No API returns the subscription's display name yet, so the deployed environment
+                names the scope instead of inventing one. */}
+            <CostDashboard subscriptionName={config.environment ?? "Subscription"} />
+          </AppShell>
         </AuthGate>
       </QueryClientProvider>
     </StrictMode>,
