@@ -8,6 +8,7 @@ import pytest
 from cost_copilot.clients.cost_management import (
     CostDataset,
     CostRecord,
+    CostUpstreamError,
     parse_query_result,
 )
 from cost_copilot.models.cost import CostFilter, CostGrouping, CostMetric
@@ -83,6 +84,39 @@ async def test_summary_runs_both_period_queries_concurrently() -> None:
     await service.summary(a_filter())
 
     assert client.peak_in_flight == 2
+
+
+class FailFirstClient:
+    """Fails the first period query and records whether the second one was cancelled."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.sibling_cancelled = False
+
+    async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
+        self.calls += 1
+        if self.calls == 1:
+            await asyncio.sleep(0)  # let the sibling reach its own await first
+            raise CostUpstreamError("upstream refused the period query")
+        try:
+            # Bounded so a regression fails the suite instead of hanging it.
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            self.sibling_cancelled = True
+            raise
+        return CostDataset(currency=None, records=())  # pragma: no cover - cancelled first
+
+
+async def test_a_failing_period_query_cancels_its_sibling() -> None:
+    """An orphaned sibling would outlive the request and drop its own exception."""
+    client = FailFirstClient()
+    service = CostService(client, now=lambda: NOW)
+
+    with pytest.raises(CostUpstreamError):
+        await service.summary(a_filter())
+
+    assert client.calls == 2
+    assert client.sibling_cancelled
 
 
 async def test_a_comparison_across_currencies_is_withheld_rather_than_invented() -> None:

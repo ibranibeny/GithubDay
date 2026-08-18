@@ -9,6 +9,7 @@ value here is located by column name and never by a fixed index.
 
 import asyncio
 import logging
+import math
 import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -262,9 +263,14 @@ def _parse_amount(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise CostResponseError("Cost Management returned an unusable cost value")
     try:
-        return float(value)
+        amount = float(value)
     except ValueError as error:
         raise CostResponseError("Cost Management returned an unusable cost value") from error
+    # JSON decoding accepts a bare NaN or Infinity, but no bill is one, and neither
+    # can be serialized back out to a caller.
+    if not math.isfinite(amount):
+        raise CostResponseError("Cost Management returned an unusable cost value")
+    return amount
 
 
 def _normalized_currency(value: Any) -> str | None:
@@ -410,11 +416,19 @@ class CostManagementClient:
         payload = await self._fetch_all_pages(build_query(filters, granularity))
         return parse_query_result(payload, grouping=requested_grouping(filters))
 
-    async def _authorization(self) -> str:
-        # Single-flight: a cold credential is asked once while other callers wait,
-        # instead of every in-flight query racing to warm the same cache.
-        async with self._token_lock:
-            return f"Bearer {await self._acquire_token()}"
+    async def _authorization(self, deadline: _Deadline) -> str:
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise CostUpstreamTimeoutError("Cost Management did not answer within the query budget")
+        try:
+            # Single-flight inside the budget: a cold credential is asked once while
+            # other callers wait, and a stuck one cannot hold the lock past the deadline.
+            async with asyncio.timeout(remaining), self._token_lock:
+                return f"Bearer {await self._acquire_token()}"
+        except TimeoutError as error:
+            raise CostUpstreamTimeoutError(
+                "Cost Management did not answer within the query budget"
+            ) from error
 
     async def _fetch_all_pages(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
         deadline = _Deadline(self._clock, QUERY_DEADLINE_SECONDS)
@@ -426,7 +440,7 @@ class CostManagementClient:
             # Re-acquired per page: the credential caches, so this is cheap, and a
             # long paging loop must not keep using a token that has since expired.
             headers = {
-                "Authorization": await self._authorization(),
+                "Authorization": await self._authorization(deadline),
                 "Content-Type": "application/json",
             }
             page = await self._post(url, body, headers, deadline)

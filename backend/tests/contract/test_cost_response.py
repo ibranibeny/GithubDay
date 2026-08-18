@@ -180,6 +180,18 @@ def test_an_unusable_cost_value_is_rejected(bad_amount: Any) -> None:
         parse_query_result(payload)
 
 
+@pytest.mark.parametrize(
+    "non_finite", [float("nan"), float("inf"), float("-inf"), "NaN", "Infinity", "-Infinity"]
+)
+def test_a_non_finite_cost_value_is_rejected(non_finite: Any) -> None:
+    """JSON decoding accepts a bare NaN or Infinity, but no bill may be one."""
+    payload = cost_fixture("groupedDaily")
+    payload["properties"]["rows"][0][0] = non_finite
+
+    with pytest.raises(CostResponseError, match="cost"):
+        parse_query_result(payload)
+
+
 def test_a_row_that_does_not_match_the_columns_is_rejected() -> None:
     payload = cost_fixture("groupedDaily")
     payload["properties"]["rows"][0] = [1.0, 20260801]

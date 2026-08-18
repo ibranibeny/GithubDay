@@ -1,6 +1,7 @@
 """Query construction, filter validation, and transport behaviour of the cost client."""
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
 from datetime import date
 from typing import Any
@@ -80,6 +81,20 @@ class SteppingClock:
     def __call__(self) -> float:
         self.now += self._step
         return self.now
+
+
+class NearlySpentClock:
+    """Holds the budget a fixed sliver above zero, so a real bound is proven in milliseconds."""
+
+    def __init__(self, remaining: float) -> None:
+        self._remaining = remaining
+        self._started = False
+
+    def __call__(self) -> float:
+        if not self._started:
+            self._started = True
+            return 0.0
+        return QUERY_DEADLINE_SECONDS - self._remaining
 
 
 @pytest.fixture
@@ -543,7 +558,7 @@ async def test_retrying_stops_once_the_query_budget_is_spent() -> None:
     respx.post(QUERY_URL).mock(return_value=httpx.Response(429))
 
     async with httpx.AsyncClient() as http_client:
-        client = a_client(http_client, clock=SteppingClock(QUERY_DEADLINE_SECONDS / 2))
+        client = a_client(http_client, clock=SteppingClock(QUERY_DEADLINE_SECONDS / 3))
 
         with pytest.raises(CostUpstreamTimeoutError):
             await client.run_query(a_filter(), "Daily")
@@ -556,11 +571,56 @@ async def test_a_request_timeout_never_outlives_the_remaining_budget() -> None:
     respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
 
     async with httpx.AsyncClient() as http_client:
-        client = a_client(http_client, clock=SteppingClock(QUERY_DEADLINE_SECONDS - 1.0))
+        client = a_client(http_client, clock=NearlySpentClock(1.0))
 
         await client.run_query(a_filter(), "Daily")
 
     assert respx.calls.last.request.extensions["timeout"]["read"] == pytest.approx(1.0)
+
+
+@respx.mock
+async def test_a_hung_credential_is_bounded_by_the_query_budget() -> None:
+    """Token acquisition sits inside the budget, or a stuck identity hangs the request."""
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
+    cancelled = asyncio.Event()
+
+    async def hung_token() -> str:
+        try:
+            # Bounded so a regression fails the suite instead of hanging it.
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return ACCESS_TOKEN  # pragma: no cover - the budget cancels this first
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, acquire_token=hung_token, clock=NearlySpentClock(0.05))
+
+        with pytest.raises(CostUpstreamTimeoutError):
+            await client.run_query(a_filter(), "Daily")
+
+    assert cancelled.is_set()
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+async def test_a_spent_budget_is_refused_before_the_credential_is_asked() -> None:
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
+    asked = False
+
+    async def counting_token() -> str:
+        nonlocal asked
+        asked = True
+        return ACCESS_TOKEN
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, acquire_token=counting_token, clock=NearlySpentClock(0.0))
+
+        with pytest.raises(CostUpstreamTimeoutError):
+            await client.run_query(a_filter(), "Daily")
+
+    assert not asked
+    assert respx.calls.call_count == 0
 
 
 @respx.mock
@@ -642,6 +702,42 @@ async def test_token_provider_closes_the_credential_it_was_given() -> None:
     await provider.aclose()
 
     assert credential.closed
+
+
+class _BlockingCredential:
+    """A credential whose token call parks, standing in for a stuck identity endpoint."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.returned = threading.Event()
+
+    def get_token(self, *scopes: str) -> _StubAccessToken:
+        # Bounded so a regression fails the suite instead of hanging it.
+        self.release.wait(timeout=10.0)
+        self.returned.set()
+        return _StubAccessToken(ACCESS_TOKEN)
+
+    def close(self) -> None:  # pragma: no cover - shutdown is not part of this test
+        raise AssertionError("the blocking credential is never closed by the provider")
+
+
+async def test_a_cancelled_token_acquisition_returns_control_immediately() -> None:
+    """Pins the worker-thread behaviour the query budget rests on.
+
+    If a cancelled acquisition waited for the thread, the deadline would be a lie
+    and the single-flight lock would stay held for as long as the identity hangs.
+    """
+    credential = _BlockingCredential()
+    provider = CredentialTokenProvider(credential)
+
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await provider()
+
+        assert not credential.returned.is_set()
+    finally:
+        credential.release.set()
 
 
 @respx.mock

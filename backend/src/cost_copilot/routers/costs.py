@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import AsyncIterator, Awaitable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import date
 from typing import Annotated
 
@@ -56,14 +56,15 @@ def build_cost_client(settings: Settings, *, acquire_token: TokenProvider) -> Co
 @asynccontextmanager
 async def cost_service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """One connection pool and one credential per application lifetime."""
-    tokens = CredentialTokenProvider(DefaultAzureCredential())
-    client = build_cost_client(get_settings(), acquire_token=tokens)
-    setattr(app.state, COST_SERVICE_STATE_ATTRIBUTE, CostService(client))
-    try:
+    async with AsyncExitStack() as resources:
+        tokens = CredentialTokenProvider(DefaultAzureCredential())
+        # Registered before the pool is built, so neither a failure building it nor a
+        # failing pool shutdown can leave the credential's transport open.
+        resources.push_async_callback(tokens.aclose)
+        client = build_cost_client(get_settings(), acquire_token=tokens)
+        resources.push_async_callback(client.aclose)
+        setattr(app.state, COST_SERVICE_STATE_ATTRIBUTE, CostService(client))
         yield
-    finally:
-        await client.aclose()
-        await tokens.aclose()
 
 
 def get_cost_service(request: Request) -> CostService:

@@ -67,7 +67,11 @@ def _latest_date(dataset: CostDataset) -> date | None:
 
 
 def _is_comparable(current: CostDataset, previous: CostDataset) -> bool:
-    """Two periods only subtract when they are priced in the same currency."""
+    """Two periods only subtract when their currencies agree.
+
+    An unknown currency counts as comparable: an empty period reports none at all,
+    and withholding the comparison there would hide a real zero baseline.
+    """
     if current.currency is None or previous.currency is None:
         return True
     return current.currency == previous.currency
@@ -102,11 +106,22 @@ class CostService:
         }
 
     async def summary(self, filters: CostFilter) -> CostSummary:
-        # The two periods are independent queries, so they run side by side.
-        current, previous = await asyncio.gather(
-            self.client.run_query(filters, DAILY_GRANULARITY),
-            self.client.run_query(filters.preceding_period(), DAILY_GRANULARITY),
-        )
+        # The two periods are independent queries, so they run side by side; a task
+        # group so the first failure cancels its sibling instead of orphaning it.
+        try:
+            async with asyncio.TaskGroup() as periods:
+                current_query = periods.create_task(
+                    self.client.run_query(filters, DAILY_GRANULARITY)
+                )
+                previous_query = periods.create_task(
+                    self.client.run_query(filters.preceding_period(), DAILY_GRANULARITY)
+                )
+        except ExceptionGroup as failures:
+            # Callers map the typed cost errors, so a failure is re-raised bare; the
+            # group stays as the cause so a sibling failure is still in the traceback.
+            raise failures.exceptions[0] from failures
+
+        current, previous = current_query.result(), previous_query.result()
 
         total = _total(current)
         comparable = _is_comparable(current, previous)

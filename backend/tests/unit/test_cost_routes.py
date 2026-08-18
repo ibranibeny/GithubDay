@@ -1,6 +1,7 @@
 """Route wiring for the cost APIs, with auth and the cost service stubbed out."""
 
 import asyncio
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -272,6 +273,40 @@ def test_an_upstream_body_without_properties_is_reported_as_unavailable() -> Non
     assert "contoso-internal" not in response.text
 
 
+def test_a_non_finite_cost_value_is_reported_as_unavailable() -> None:
+    """End to end: a bare NaN must fail typed, not crash the JSON encoder as a 500."""
+    payload = cost_fixture("groupedDaily")
+    payload["properties"]["rows"][0][0] = float("nan")
+    body = json.dumps(payload).encode()  # json.dumps emits the bare NaN that ARM could send
+
+    app = create_app()
+    app.dependency_overrides[verify_token] = lambda: CLAIMS
+
+    async def token() -> str:
+        return "stub-token"  # noqa: S105  # not a credential, only a stub value
+
+    http_client = httpx.AsyncClient()
+    try:
+        with respx.mock:
+            respx.post(QUERY_URL).mock(
+                return_value=httpx.Response(
+                    200, content=body, headers={"content-type": "application/json"}
+                )
+            )
+            app.state.cost_service = CostService(
+                CostManagementClient(
+                    settings=get_settings(), http_client=http_client, acquire_token=token
+                ),
+                now=lambda: NOW,
+            )
+            response = TestClient(app).get("/api/costs/summary", params=PARAMS)
+    finally:
+        asyncio.run(http_client.aclose())
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": UPSTREAM_UNAVAILABLE_DETAIL}
+
+
 async def test_the_default_client_targets_only_the_configured_subscription() -> None:
     async def token() -> str:
         return "stub-token"  # noqa: S105  # not a credential, only a stub value
@@ -291,13 +326,27 @@ class _RecordingCredential:
     """Stands in for DefaultAzureCredential so shutdown never touches an identity endpoint."""
 
     def __init__(self) -> None:
-        self.closed = False
+        self.close_calls = 0
 
     def get_token(self, *scopes: str) -> object:  # pragma: no cover - no request is issued
         raise AssertionError("the shutdown test must not acquire a token")
 
     def close(self) -> None:
-        self.closed = True
+        self.close_calls += 1
+
+
+class _FailingCloseClient:
+    """A pool whose own shutdown fails, so the credential must still be released."""
+
+    def __init__(self) -> None:
+        self.aclose_calls = 0
+
+    async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
+        raise AssertionError("the shutdown test must not query")  # pragma: no cover
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        raise RuntimeError("pool shutdown failed")
 
 
 def test_the_production_cost_client_and_credential_are_closed_on_shutdown(
@@ -315,7 +364,44 @@ def test_the_production_cost_client_and_credential_are_closed_on_shutdown(
         assert not cost_client.is_closed
 
     assert cost_client.is_closed
-    assert credential.closed
+    assert credential.close_calls == 1
+
+
+def test_a_failing_client_shutdown_still_closes_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leaked credential keeps its own transport, and its token cache, alive."""
+    credential = _RecordingCredential()
+    failing = _FailingCloseClient()
+    monkeypatch.setattr(costs, "DefaultAzureCredential", lambda: credential)
+    monkeypatch.setattr(costs, "build_cost_client", lambda settings, *, acquire_token: failing)
+    app = create_app()
+
+    with pytest.raises(RuntimeError, match="pool shutdown failed"):
+        with TestClient(app):
+            pass
+
+    assert failing.aclose_calls == 1
+    assert credential.close_calls == 1
+
+
+def test_a_failure_while_building_the_client_still_closes_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = _RecordingCredential()
+
+    def explode(settings: object, *, acquire_token: object) -> CostManagementClient:
+        raise RuntimeError("pool construction failed")
+
+    monkeypatch.setattr(costs, "DefaultAzureCredential", lambda: credential)
+    monkeypatch.setattr(costs, "build_cost_client", explode)
+    app = create_app()
+
+    with pytest.raises(RuntimeError, match="pool construction failed"):
+        with TestClient(app):
+            raise AssertionError("startup must fail")  # pragma: no cover
+
+    assert credential.close_calls == 1
 
 
 def test_a_request_before_startup_is_refused_instead_of_building_a_client() -> None:
