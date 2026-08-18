@@ -283,7 +283,13 @@ check_azure_context() {
     err "'az account show' failed. Run 'az login' (device code is fine) and retry."
     return 1
   fi
-  IFS=$'\t' read -r tenant subscription signed_in_as <<<"$account"
+  # `--query '[a,b,c]' -o tsv` prints one value per line (an array becomes rows),
+  # not a single tab-delimited row, so read the fields line by line.
+  {
+    IFS= read -r tenant
+    IFS= read -r subscription
+    IFS= read -r signed_in_as
+  } <<<"$account" || true
 
   local failed=0
   if [ "$tenant" != "$AZURE_TENANT_ID" ]; then

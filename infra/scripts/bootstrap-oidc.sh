@@ -488,11 +488,11 @@ main() {
   local test_client_id test_principal_id
 
   staging_values="$(ensure_identity "$staging_identity" "$shared_group" "$ACA_LOCATION")"
-  IFS=$'\t' read -r staging_client_id staging_principal_id <<<"$staging_values"
+  { IFS= read -r staging_client_id; IFS= read -r staging_principal_id; } <<<"$staging_values" || true
   production_values="$(ensure_identity "$production_identity" "$shared_group" "$ACA_LOCATION")"
-  IFS=$'\t' read -r production_client_id production_principal_id <<<"$production_values"
+  { IFS= read -r production_client_id; IFS= read -r production_principal_id; } <<<"$production_values" || true
   test_values="$(ensure_identity "$TEST_IDENTITY_NAME" "$shared_group" "$ACA_LOCATION")"
-  IFS=$'\t' read -r test_client_id test_principal_id <<<"$test_values"
+  { IFS= read -r test_client_id; IFS= read -r test_principal_id; } <<<"$test_values" || true
 
   local repository
   repository="$(github_repository)"
