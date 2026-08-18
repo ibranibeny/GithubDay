@@ -1,21 +1,27 @@
 """Signing-key resolution: JWKS cache policy and unknown-kid throttling."""
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
 
 import jwt
 import pytest
-from jwt.exceptions import PyJWKClientError
+from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError
 
 from constants import TEST_TENANT_ID
 from cost_copilot.auth import (
     JWKS_CACHE_LIFESPAN_SECONDS,
+    JWKS_FORCED_REFRESH_COOLDOWN_SECONDS,
     JWKS_TIMEOUT_SECONDS,
     UNKNOWN_KID_CACHE_SIZE,
     UNKNOWN_KID_TTL_SECONDS,
     EntraSigningKeyResolver,
+    UnknownKidCache,
     UnknownSigningKeyError,
     unverified_kid,
 )
+
+# Valid base64url for the 24-byte secret backing the symmetric JWKs used below.
+OCT_KEY_MATERIAL = "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0"
 
 
 class Clock:
@@ -43,13 +49,38 @@ class CountingLookup:
         return self._key
 
 
+class ScriptedLookup:
+    """Plays back one outcome per call: exceptions are raised, anything else returned."""
+
+    def __init__(self, *outcomes: Any) -> None:
+        self.calls: list[str] = []
+        self._outcomes = list(outcomes)
+
+    def __call__(self, token: str) -> Any:
+        self.calls.append(token)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 def token_with_kid(kid: str | None) -> str:
     headers = {"kid": kid} if kid is not None else {}
     return jwt.encode({"sub": "s"}, key="k" * 32, algorithm="HS256", headers=headers)
 
 
-def build_resolver(lookup: CountingLookup, clock: Clock) -> EntraSigningKeyResolver:
-    return EntraSigningKeyResolver(TEST_TENANT_ID, key_lookup=lookup, time_source=clock)
+def build_resolver(
+    lookup: Callable[[str], Any],
+    clock: Clock,
+    cached_kids: set[str] | None = None,
+) -> EntraSigningKeyResolver:
+    kids = set(cached_kids or ())
+    return EntraSigningKeyResolver(
+        TEST_TENANT_ID,
+        key_lookup=lookup,
+        cached_key_ids=lambda: kids,
+        time_source=clock,
+    )
 
 
 def test_jwks_client_is_configured_with_a_bounded_cache_lifespan() -> None:
@@ -76,15 +107,67 @@ def test_unknown_kid_is_looked_up_once_then_denied_from_cache() -> None:
     assert len(lookup.calls) == 1
 
 
-def test_a_different_unknown_kid_is_still_looked_up() -> None:
+def test_distinct_unknown_kids_share_a_single_forced_refresh() -> None:
     lookup, clock = CountingLookup(), Clock()
     resolver = build_resolver(lookup, clock)
 
-    for kid in ("kid-a", "kid-b"):
-        with pytest.raises(PyJWKClientError):
-            resolver(token_with_kid(kid))
+    with pytest.raises(PyJWKClientError):
+        resolver(token_with_kid("kid-0"))
+    for index in range(1, 20):
+        with pytest.raises(UnknownSigningKeyError):
+            resolver(token_with_kid(f"kid-{index}"))
+
+    assert len(lookup.calls) == 1
+
+
+def test_a_forced_refresh_is_allowed_again_after_the_cooldown() -> None:
+    lookup, clock = CountingLookup(), Clock()
+    resolver = build_resolver(lookup, clock)
+
+    with pytest.raises(PyJWKClientError):
+        resolver(token_with_kid("kid-a"))
+    with pytest.raises(UnknownSigningKeyError):
+        resolver(token_with_kid("kid-b"))
+    clock.advance(JWKS_FORCED_REFRESH_COOLDOWN_SECONDS)
+    with pytest.raises(PyJWKClientError):
+        resolver(token_with_kid("kid-c"))
 
     assert len(lookup.calls) == 2
+
+
+def test_a_cached_kid_resolves_while_forced_refreshes_are_throttled() -> None:
+    lookup, clock = ScriptedLookup(PyJWKClientError("no match"), "key-material"), Clock()
+    resolver = build_resolver(lookup, clock, cached_kids={"rotated-kid"})
+
+    with pytest.raises(PyJWKClientError):
+        resolver(token_with_kid("attacker-kid"))
+
+    assert resolver(token_with_kid("rotated-kid")) == "key-material"
+    assert len(lookup.calls) == 2
+
+
+def test_cached_key_ids_read_the_client_cache_without_fetching() -> None:
+    resolver = EntraSigningKeyResolver(TEST_TENANT_ID)
+    cache = resolver.jwks_client.jwk_set_cache
+    assert cache is not None
+
+    assert resolver.signing_key_ids_in_cache() == set()
+
+    # PyJWT annotates put() as taking a PyJWKSet, but get_jwk_set() only accepts the
+    # raw dict that fetch_data() actually stores, so the annotation is the wrong one.
+    cache.put(
+        cast(
+            Any,
+            {
+                "keys": [
+                    {"kty": "oct", "k": OCT_KEY_MATERIAL, "kid": "sig-kid", "use": "sig"},
+                    {"kty": "oct", "k": OCT_KEY_MATERIAL, "kid": "enc-kid", "use": "enc"},
+                ]
+            },
+        )
+    )
+
+    assert resolver.signing_key_ids_in_cache() == {"sig-kid"}
 
 
 def test_negative_cache_expires_so_key_rotation_still_resolves() -> None:
@@ -102,40 +185,55 @@ def test_negative_cache_expires_so_key_rotation_still_resolves() -> None:
 
 
 def test_negative_cache_is_bounded_to_a_fixed_number_of_kids() -> None:
-    lookup, clock = CountingLookup(), Clock()
-    resolver = build_resolver(lookup, clock)
-    first = token_with_kid("kid-0")
+    # Driven directly: the global refresh throttle caps how fast the resolver can fill it.
+    cache = UnknownKidCache(time_source=Clock())
 
-    with pytest.raises(PyJWKClientError):
-        resolver(first)
-    for index in range(1, UNKNOWN_KID_CACHE_SIZE + 1):
-        with pytest.raises(PyJWKClientError):
-            resolver(token_with_kid(f"kid-{index}"))
+    for index in range(UNKNOWN_KID_CACHE_SIZE + 1):
+        cache.record(f"kid-{index}")
 
-    # The oldest entry was evicted, so the first kid is looked up again.
-    with pytest.raises(PyJWKClientError):
-        resolver(first)
-    assert lookup.calls[-1] == first
+    assert not cache.is_denied("kid-0")
+    assert cache.is_denied("kid-1")
 
 
-def test_tokens_without_a_kid_are_never_negatively_cached() -> None:
+def test_tokens_without_a_kid_are_throttled_but_never_denied_permanently() -> None:
     lookup, clock = CountingLookup(), Clock()
     resolver = build_resolver(lookup, clock)
     token = token_with_kid(None)
 
-    for _ in range(3):
-        with pytest.raises(PyJWKClientError):
-            resolver(token)
+    with pytest.raises(PyJWKClientError):
+        resolver(token)
+    with pytest.raises(UnknownSigningKeyError):
+        resolver(token)
+    clock.advance(JWKS_FORCED_REFRESH_COOLDOWN_SECONDS)
+    with pytest.raises(PyJWKClientError) as error:
+        resolver(token)
 
-    assert len(lookup.calls) == 3
+    assert not isinstance(error.value, UnknownSigningKeyError)
+    assert len(lookup.calls) == 2
 
 
 def test_successful_resolution_is_not_negatively_cached() -> None:
     lookup, clock = CountingLookup(key="key-material"), Clock()
-    resolver = build_resolver(lookup, clock)
+    resolver = build_resolver(lookup, clock, cached_kids={"good-kid"})
     token = token_with_kid("good-kid")
 
     assert resolver(token) == "key-material"
+    assert resolver(token) == "key-material"
+    assert len(lookup.calls) == 2
+
+
+def test_connection_failures_are_not_negatively_cached() -> None:
+    lookup = ScriptedLookup(PyJWKClientConnectionError("jwks unreachable"), "key-material")
+    clock = Clock()
+    resolver = build_resolver(lookup, clock)
+    token = token_with_kid("legit-kid")
+
+    with pytest.raises(PyJWKClientConnectionError):
+        resolver(token)
+    # Well short of the negative-cache TTL, so only the connection rule can allow this.
+    assert JWKS_FORCED_REFRESH_COOLDOWN_SECONDS < UNKNOWN_KID_TTL_SECONDS
+    clock.advance(JWKS_FORCED_REFRESH_COOLDOWN_SECONDS)
+
     assert resolver(token) == "key-material"
     assert len(lookup.calls) == 2
 

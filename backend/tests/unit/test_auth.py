@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from jwt.exceptions import PyJWKClientConnectionError
 
 from constants import TEST_API_CLIENT_ID, TEST_TENANT_ID
 from cost_copilot.auth import (
@@ -219,6 +220,23 @@ def test_signing_key_lookup_failure_does_not_leak_details(
     assert_unauthorized(response)
     assert "jwks" not in response.text
     assert "internal.example" not in response.text
+
+
+def test_transient_jwks_connection_failure_is_unauthorized(
+    rsa_key_pair: tuple[str, str],
+) -> None:
+    private_pem, _ = rsa_key_pair
+
+    def unreachable_resolver(_token: str) -> str:
+        raise PyJWKClientConnectionError("jwks unreachable")
+
+    with TestClient(build_protected_app(unreachable_resolver)) as client:
+        response = client.get(
+            "/protected",
+            headers={"Authorization": f"Bearer {encode(private_pem)}"},
+        )
+
+    assert_unauthorized(response)
 
 
 def test_default_signing_key_resolver_targets_the_configured_tenant() -> None:

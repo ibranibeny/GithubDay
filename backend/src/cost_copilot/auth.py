@@ -13,7 +13,7 @@ import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWK, PyJWKClient
-from jwt.exceptions import PyJWKClientError, PyJWTError
+from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError, PyJWTError
 
 from cost_copilot.config import Settings, get_settings
 from cost_copilot.errors import forbidden_role_error, unauthorized_error
@@ -25,6 +25,7 @@ REQUIRED_TOKEN_VERSION = "2.0"  # noqa: S105  # Entra token format version, not 
 
 JWKS_CACHE_LIFESPAN_SECONDS = 300.0
 JWKS_TIMEOUT_SECONDS = 5.0
+JWKS_FORCED_REFRESH_COOLDOWN_SECONDS = 10.0
 UNKNOWN_KID_TTL_SECONDS = 30.0
 UNKNOWN_KID_CACHE_SIZE = 256
 
@@ -45,11 +46,10 @@ class SigningKeyResolver(Protocol):
 
 
 class UnknownKidCache:
-    """Bounded, TTL'd set of key ids that JWKS could not resolve.
+    """Bounded, TTL'd set of key ids that a JWKS lookup definitively rejected.
 
-    Without it every token carrying an unrecognised `kid` forces PyJWKClient to
-    re-fetch the JWKS document, so unauthenticated callers can drive outbound
-    traffic at will. Entries expire so a genuine key rotation is still picked up.
+    Keeps a known-bad `kid` from consuming the shared refresh budget on every
+    request. Entries expire so a genuine key rotation is still picked up.
     """
 
     def __init__(
@@ -97,13 +97,21 @@ def unverified_kid(token: str) -> str | None:
 
 
 class EntraSigningKeyResolver:
-    """Fetches signing keys from the tenant JWKS endpoint."""
+    """Fetches signing keys from the tenant JWKS endpoint.
+
+    PyJWKClient re-fetches the JWKS document whenever a token's `kid` is not in
+    the cached set, so unauthenticated callers could otherwise drive outbound
+    traffic by varying the `kid` on every request. Two limits close that off: a
+    per-kid negative cache, and a global cooldown that caps forced refreshes to
+    one per window no matter how many distinct key ids arrive.
+    """
 
     def __init__(
         self,
         tenant_id: str,
         *,
         key_lookup: Callable[[str], SigningKey] | None = None,
+        cached_key_ids: Callable[[], set[str]] | None = None,
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
         self.jwks_uri = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
@@ -115,16 +123,50 @@ class EntraSigningKeyResolver:
             timeout=JWKS_TIMEOUT_SECONDS,
         )
         self._lookup = key_lookup or self.jwks_client.get_signing_key_from_jwt
+        self._cached_key_ids = cached_key_ids or self.signing_key_ids_in_cache
+        self._now = time_source
         self._unknown_kids = UnknownKidCache(time_source=time_source)
+        self._refresh_lock = threading.Lock()
+        self._last_forced_refresh: float | None = None
+
+    def signing_key_ids_in_cache(self) -> set[str]:
+        """Key ids already held locally, filtered the way PyJWKClient filters them.
+
+        Reads only the cache: an empty or expired cache reads as empty rather
+        than triggering the fetch this class exists to ration.
+        """
+        cache = self.jwks_client.jwk_set_cache
+        if cache is None or cache.get() is None:
+            return set()
+        return {
+            key.key_id
+            for key in self.jwks_client.get_jwk_set().keys
+            if key.key_id and key.public_key_use in ("sig", None)
+        }
+
+    def _claim_forced_refresh(self) -> bool:
+        """Grant at most one JWKS refetch per cooldown, across every caller and kid."""
+        now = self._now()
+        with self._refresh_lock:
+            last = self._last_forced_refresh
+            if last is not None and now - last < JWKS_FORCED_REFRESH_COOLDOWN_SECONDS:
+                return False
+            self._last_forced_refresh = now
+            return True
 
     def __call__(self, token: str) -> SigningKey:
         kid = unverified_kid(token)
         if kid is not None and self._unknown_kids.is_denied(kid):
             raise UnknownSigningKeyError("Signing key id was rejected by a recent lookup")
+        # A missing kid also misses the cached set, so it is rationed the same way.
+        if (kid is None or kid not in self._cached_key_ids()) and not self._claim_forced_refresh():
+            raise UnknownSigningKeyError("Signing key id is uncached and refresh is throttled")
         try:
             return self._lookup(token)
-        except Exception:
-            if kid is not None:
+        except PyJWKClientError as error:
+            # Only a definitive no-match is cached: a connection failure says nothing
+            # about the kid, and caching it would deny a valid key for the whole TTL.
+            if kid is not None and not isinstance(error, PyJWKClientConnectionError):
                 self._unknown_kids.record(kid)
             raise
 
