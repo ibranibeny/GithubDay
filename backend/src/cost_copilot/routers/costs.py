@@ -1,13 +1,14 @@
 """Read-only cost endpoints backed by the Cost Management Query API."""
 
 import logging
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Annotated
 
 import httpx
 from azure.identity import DefaultAzureCredential
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from cost_copilot.auth import CostReaderClaims
@@ -38,32 +39,39 @@ UPSTREAM_UNAVAILABLE_DETAIL = "Cost data is unavailable"
 UPSTREAM_THROTTLED_DETAIL = "Cost data is rate limited; retry shortly"
 UPSTREAM_TIMEOUT_DETAIL = "Cost data request timed out"
 
-_service: CostService | None = None
+COST_SERVICE_STATE_ATTRIBUTE = "cost_service"
 
 
-def build_cost_service(settings: Settings) -> CostService:
+def build_cost_client(settings: Settings) -> CostManagementClient:
     """Compose the production client. The scope is read from settings only."""
-    return CostService(
-        CostManagementClient(
-            settings=settings,
-            http_client=httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS),
-            acquire_token=CredentialTokenProvider(DefaultAzureCredential()),
-        )
+    return CostManagementClient(
+        settings=settings,
+        http_client=httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS),
+        acquire_token=CredentialTokenProvider(DefaultAzureCredential()),
     )
 
 
-def reset_cost_service() -> None:
-    """Drop the cached service; used by tests that build their own."""
-    global _service
-    _service = None
+def build_cost_service(settings: Settings) -> CostService:
+    return CostService(build_cost_client(settings))
 
 
-def get_cost_service(settings: Annotated[Settings, Depends(get_settings)]) -> CostService:
-    """Dependency seam: overridden in tests, cached for the process otherwise."""
-    global _service
-    if _service is None:
-        _service = build_cost_service(settings)
-    return _service
+@asynccontextmanager
+async def cost_service_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """One connection pool per application lifetime, closed on shutdown."""
+    client = build_cost_client(get_settings())
+    setattr(app.state, COST_SERVICE_STATE_ATTRIBUTE, CostService(client))
+    try:
+        yield
+    finally:
+        await client.aclose()
+
+
+def get_cost_service(request: Request) -> CostService:
+    """Dependency seam: overridden in tests, owned by the lifespan otherwise."""
+    service = getattr(request.app.state, COST_SERVICE_STATE_ATTRIBUTE, None)
+    if not isinstance(service, CostService):
+        raise HTTPException(status_code=503, detail=UPSTREAM_UNAVAILABLE_DETAIL)
+    return service
 
 
 def build_filter(

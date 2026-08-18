@@ -11,7 +11,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, time
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -32,6 +32,11 @@ COST_AGGREGATION_ALIAS = "totalCost"
 REQUESTED_COST_COLUMN = "Cost"
 UNASSIGNED_DIMENSION = "Unassigned"
 
+# `QueryTimePeriod.from`/`.to` are date-time, and both filter days are inclusive, so the
+# window runs from the first day's midnight to the last day's final second in UTC.
+DAY_START = time(0, 0, 0, tzinfo=UTC)
+DAY_END = time(23, 59, 59, tzinfo=UTC)
+
 REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_RETRIES = 3
 MAX_PAGES = 50
@@ -43,6 +48,12 @@ RETRY_AFTER_HEADERS = ("x-ms-ratelimit-microsoft.consumption-retry-after", "retr
 
 DATE_COLUMN_NAMES = frozenset({"usagedate", "billingmonth"})
 CURRENCY_COLUMN_NAMES = frozenset({"currency", "billingcurrency", "billingcurrencycode"})
+# The cost column is named per offer: MCA answers with Cost, EA and legacy with PreTaxCost.
+KNOWN_COST_COLUMN_NAMES = frozenset(
+    {"cost", "costusd", "pretaxcost", "pretaxcostusd", "costinbillingcurrency"}
+)
+# A TagKey grouping answers with a TagKey/TagValue pair; the value carries the group label.
+TAG_VALUE_COLUMN_NAMES = frozenset({"tagvalue"})
 NUMBER_COLUMN_TYPE = "number"
 STRING_COLUMN_TYPE = "string"
 
@@ -86,13 +97,28 @@ class CostDataset:
     records: tuple[CostRecord, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RequestedGrouping:
+    """What the caller asked to group by, so the label column is bound by name."""
+
+    name: str
+    is_tag: bool
+
+
+def requested_grouping(filters: CostFilter) -> RequestedGrouping:
+    return RequestedGrouping(filters.azure_dimension, filters.grouping is CostGrouping.TAG)
+
+
 def build_query(filters: CostFilter, granularity: str) -> dict[str, Any]:
     """Build the query body. Values travel in JSON, never in the URL."""
     grouping_type = "TagKey" if filters.grouping is CostGrouping.TAG else "Dimension"
     return {
         "type": filters.metric.value,
         "timeframe": "Custom",
-        "timePeriod": {"from": filters.start.isoformat(), "to": filters.end.isoformat()},
+        "timePeriod": {
+            "from": datetime.combine(filters.start, DAY_START).isoformat(),
+            "to": datetime.combine(filters.end, DAY_END).isoformat(),
+        },
         "dataset": {
             "granularity": granularity,
             "aggregation": {
@@ -156,19 +182,44 @@ def _index_of_named(names: Sequence[str], candidates: frozenset[str]) -> int | N
     return None
 
 
-def _cost_index(names: Sequence[str], types: Sequence[str], date_index: int | None) -> int:
-    """Prefer the requested aggregation, then any numeric column that is not the date."""
-    preferred = {COST_AGGREGATION_ALIAS.casefold(), REQUESTED_COST_COLUMN.casefold()}
+def _named_index(
+    names: Sequence[str], types: Sequence[str], candidates: frozenset[str], column_type: str
+) -> int | None:
     for index, name in enumerate(names):
-        if name.casefold() in preferred and types[index] == NUMBER_COLUMN_TYPE:
+        if name.casefold() in candidates and types[index] == column_type:
             return index
+    return None
+
+
+def _cost_index(names: Sequence[str], types: Sequence[str], date_index: int | None) -> int:
+    """Bind the amount offer-agnostically: alias, then a known cost column, then any number."""
+    alias = _named_index(
+        names, types, frozenset({COST_AGGREGATION_ALIAS.casefold()}), NUMBER_COLUMN_TYPE
+    )
+    if alias is not None:
+        return alias
+    known = _named_index(names, types, KNOWN_COST_COLUMN_NAMES, NUMBER_COLUMN_TYPE)
+    if known is not None:
+        return known
     for index, column_type in enumerate(types):
         if column_type == NUMBER_COLUMN_TYPE and index != date_index:
             return index
     raise CostResponseError("Cost Management response has no usable cost column")
 
 
-def _dimension_index(types: Sequence[str], currency_index: int | None) -> int | None:
+def _dimension_index(
+    names: Sequence[str],
+    types: Sequence[str],
+    currency_index: int | None,
+    grouping: RequestedGrouping | None,
+) -> int | None:
+    if grouping is not None:
+        wanted = (
+            TAG_VALUE_COLUMN_NAMES if grouping.is_tag else frozenset({grouping.name.casefold()})
+        )
+        requested = _named_index(names, types, wanted, STRING_COLUMN_TYPE)
+        if requested is not None:
+            return requested
     for index, column_type in enumerate(types):
         if column_type == STRING_COLUMN_TYPE and index != currency_index:
             return index
@@ -196,7 +247,9 @@ def _parse_amount(value: Any) -> float:
         raise CostResponseError("Cost Management returned an unusable cost value") from error
 
 
-def parse_query_result(payload: Mapping[str, Any]) -> CostDataset:
+def parse_query_result(
+    payload: Mapping[str, Any], *, grouping: RequestedGrouping | None = None
+) -> CostDataset:
     """Normalize one merged query result, mapping every value by column name."""
     columns, rows, _ = _page_parts(payload)
     if not rows:
@@ -207,7 +260,7 @@ def parse_query_result(payload: Mapping[str, Any]) -> CostDataset:
     date_index = _index_of_named(names, DATE_COLUMN_NAMES)
     currency_index = _index_of_named(names, CURRENCY_COLUMN_NAMES)
     cost_index = _cost_index(names, types, date_index)
-    dimension_index = _dimension_index(types, currency_index)
+    dimension_index = _dimension_index(names, types, currency_index, grouping)
 
     records: list[CostRecord] = []
     currencies: set[str] = set()
@@ -285,11 +338,16 @@ class CostManagementClient:
     def url(self) -> str:
         return self._url
 
+    @property
+    def is_closed(self) -> bool:
+        return self._http.is_closed
+
     async def aclose(self) -> None:
         await self._http.aclose()
 
     async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
-        return parse_query_result(await self._fetch_all_pages(build_query(filters, granularity)))
+        payload = await self._fetch_all_pages(build_query(filters, granularity))
+        return parse_query_result(payload, grouping=requested_grouping(filters))
 
     async def _fetch_all_pages(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
         token = await self._acquire_token()

@@ -30,7 +30,6 @@ from cost_copilot.routers.costs import (
     UPSTREAM_UNAVAILABLE_DETAIL,
     build_cost_service,
     get_cost_service,
-    reset_cost_service,
 )
 from cost_copilot.services.cost_service import CostService
 from fixture_data import cost_fixture
@@ -222,13 +221,35 @@ async def test_the_default_service_targets_only_the_configured_subscription() ->
         await client.aclose()
 
 
-async def test_the_default_service_is_reused_across_requests() -> None:
-    settings = get_settings()
-    first = get_cost_service(settings)
-    try:
-        assert get_cost_service(settings) is first
-        assert isinstance(first.client, CostManagementClient)
-    finally:
-        assert isinstance(first.client, CostManagementClient)
-        await first.client.aclose()
-        reset_cost_service()
+def test_the_production_cost_client_is_closed_on_shutdown() -> None:
+    app = create_app()
+
+    with TestClient(app):
+        service = app.state.cost_service
+        assert isinstance(service, CostService)
+        cost_client = service.client
+        assert isinstance(cost_client, CostManagementClient)
+        assert not cost_client.is_closed
+
+    assert cost_client.is_closed
+
+
+def test_a_request_before_startup_is_refused_instead_of_building_a_client() -> None:
+    app = create_app()
+    app.dependency_overrides[verify_token] = lambda: CLAIMS
+
+    response = TestClient(app).get("/api/costs/summary", params=PARAMS)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": UPSTREAM_UNAVAILABLE_DETAIL}
+
+
+def test_the_service_the_lifespan_published_is_served_to_requests() -> None:
+    app = create_app()
+    app.dependency_overrides[verify_token] = lambda: CLAIMS
+    app.state.cost_service = CostService(StubCostClient(), now=lambda: NOW)
+
+    response = TestClient(app).get("/api/costs/trend", params=PARAMS)
+
+    assert response.status_code == 200
+    assert response.json()["points"] == []

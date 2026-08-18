@@ -52,6 +52,53 @@
       "nextLink": null
     }
   },
+  "preTaxCostOfferWithQuantity": {
+    "properties": {
+      "columns": [
+        { "name": "ResourceGroupName", "type": "String" },
+        { "name": "UsageQuantity", "type": "Number" },
+        { "name": "PreTaxCost", "type": "Number" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [
+        ["rg-fabrikam-dev", 3.0, 41.25, "EUR"],
+        ["rg-fabrikam-prod", 9.0, 108.75, "EUR"]
+      ],
+      "nextLink": null
+    }
+  },
+  "tagGrouped": {
+    "properties": {
+      "columns": [
+        { "name": "TagKey", "type": "String" },
+        { "name": "TagValue", "type": "String" },
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [
+        ["cost-center", "fin-ops", 12.5, 20260801, "USD"],
+        ["cost-center", "platform", 7.5, 20260801, "USD"]
+      ],
+      "nextLink": null
+    }
+  },
+  "dimensionGroupedWithExtraString": {
+    "properties": {
+      "columns": [
+        { "name": "ResourceType", "type": "String" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [
+        ["microsoft.compute/virtualmachines", "Fabrikam Widget Service", 12.5, 20260801, "USD"],
+        ["microsoft.sql/servers", "Fabrikam Ledger Service", 7.5, 20260801, "USD"]
+      ],
+      "nextLink": null
+    }
+  },
   "ungrouped": {
     "properties": {
       "columns": [

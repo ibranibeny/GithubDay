@@ -77,11 +77,19 @@ def test_daily_query_is_bounded_and_grouped() -> None:
 
     assert query["type"] == "ActualCost"
     assert query["timeframe"] == "Custom"
-    assert query["timePeriod"] == {"from": "2026-08-01", "to": "2026-08-17"}
     dataset = query["dataset"]
     assert dataset["granularity"] == "Daily"
     assert dataset["aggregation"] == {"totalCost": {"name": "Cost", "function": "Sum"}}
     assert dataset["grouping"] == [{"type": "Dimension", "name": "ServiceName"}]
+
+
+def test_the_time_period_is_emitted_as_utc_date_times_covering_both_end_days() -> None:
+    query = build_query(a_filter(), granularity="Daily")
+
+    assert query["timePeriod"] == {
+        "from": "2026-08-01T00:00:00+00:00",
+        "to": "2026-08-17T23:59:59+00:00",
+    }
 
 
 def test_amortized_metric_maps_to_the_documented_export_type() -> None:
@@ -177,6 +185,51 @@ async def test_caller_supplied_values_never_reach_the_request_url(
 
 def test_query_url_is_derived_only_from_settings() -> None:
     assert query_url(get_settings().azure_subscription_id) == QUERY_URL
+
+
+@respx.mock
+@pytest.mark.parametrize("fixture", ["preTaxCostOffer", "preTaxCostOfferWithQuantity"])
+async def test_a_legacy_offer_cost_column_is_bound_end_to_end(
+    client: CostManagementClient, fixture: str
+) -> None:
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture(fixture)))
+
+    dataset = await client.run_query(a_filter(grouping=CostGrouping.RESOURCE_GROUP), "Daily")
+
+    assert dataset.currency == "EUR"
+    assert [(record.dimension, record.amount) for record in dataset.records] == [
+        ("rg-fabrikam-dev", 41.25),
+        ("rg-fabrikam-prod", 108.75),
+    ]
+
+
+@respx.mock
+async def test_a_tag_grouped_response_binds_the_tag_value_column(
+    client: CostManagementClient,
+) -> None:
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("tagGrouped")))
+
+    dataset = await client.run_query(
+        a_filter(grouping=CostGrouping.TAG, tag_key="cost-center"), "Daily"
+    )
+
+    assert [record.dimension for record in dataset.records] == ["fin-ops", "platform"]
+
+
+@respx.mock
+async def test_the_requested_dimension_wins_over_another_string_column(
+    client: CostManagementClient,
+) -> None:
+    respx.post(QUERY_URL).mock(
+        return_value=httpx.Response(200, json=cost_fixture("dimensionGroupedWithExtraString"))
+    )
+
+    dataset = await client.run_query(a_filter(), "Daily")
+
+    assert [record.dimension for record in dataset.records] == [
+        "Fabrikam Widget Service",
+        "Fabrikam Ledger Service",
+    ]
 
 
 @respx.mock

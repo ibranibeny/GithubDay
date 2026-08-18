@@ -10,7 +10,11 @@ from typing import Any
 
 import pytest
 
-from cost_copilot.clients.cost_management import CostResponseError, parse_query_result
+from cost_copilot.clients.cost_management import (
+    CostResponseError,
+    RequestedGrouping,
+    parse_query_result,
+)
 from fixture_data import cost_fixture
 
 
@@ -33,7 +37,7 @@ def test_shuffling_the_column_order_does_not_change_the_result() -> None:
     assert shuffled == ordered
 
 
-def test_an_offer_specific_cost_column_is_found_by_type() -> None:
+def test_an_offer_specific_cost_column_is_found_by_name() -> None:
     dataset = parse_query_result(cost_fixture("preTaxCostOffer"))
 
     assert dataset.currency == "EUR"
@@ -43,6 +47,59 @@ def test_an_offer_specific_cost_column_is_found_by_type() -> None:
         "rg-fabrikam-prod",
     ]
     assert {record.usage_date for record in dataset.records} == {date(2026, 8, 1)}
+
+
+def test_a_known_offer_cost_column_wins_over_another_number_column() -> None:
+    dataset = parse_query_result(cost_fixture("preTaxCostOfferWithQuantity"))
+
+    assert [record.amount for record in dataset.records] == [41.25, 108.75]
+
+
+def test_the_aggregation_alias_column_is_preferred() -> None:
+    payload = cost_fixture("preTaxCostOfferWithQuantity")
+    payload["properties"]["columns"][1]["name"] = "totalCost"
+
+    assert [record.amount for record in parse_query_result(payload).records] == [3.0, 9.0]
+
+
+def test_an_unknown_cost_column_name_falls_back_to_the_only_other_number_column() -> None:
+    payload = cost_fixture("groupedDaily")
+    payload["properties"]["columns"][0]["name"] = "BilledCost"
+
+    assert [record.amount for record in parse_query_result(payload).records] == [
+        12.5,
+        7.5,
+        20.0,
+        5.0,
+    ]
+
+
+def test_a_tag_grouped_result_binds_the_tag_value_column() -> None:
+    dataset = parse_query_result(
+        cost_fixture("tagGrouped"), grouping=RequestedGrouping("cost-center", is_tag=True)
+    )
+
+    assert [record.dimension for record in dataset.records] == ["fin-ops", "platform"]
+
+
+def test_a_dimension_grouped_result_binds_the_requested_dimension() -> None:
+    dataset = parse_query_result(
+        cost_fixture("dimensionGroupedWithExtraString"),
+        grouping=RequestedGrouping("ServiceName", is_tag=False),
+    )
+
+    assert [record.dimension for record in dataset.records] == [
+        "Fabrikam Widget Service",
+        "Fabrikam Ledger Service",
+    ]
+
+
+def test_a_requested_dimension_the_answer_omits_falls_back_to_the_first_label_column() -> None:
+    dataset = parse_query_result(
+        cost_fixture("groupedDaily"), grouping=RequestedGrouping("ResourceGroupName", is_tag=False)
+    )
+
+    assert dataset.records[0].dimension == "Fabrikam Widget Service"
 
 
 def test_a_result_without_a_grouping_column_is_still_parsed() -> None:

@@ -11,7 +11,11 @@ from cost_copilot.routers import costs, health
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="Azure Cost Copilot API", version=__version__)
+    app = FastAPI(
+        title="Azure Cost Copilot API",
+        version=__version__,
+        lifespan=costs.cost_service_lifespan,
+    )
     # add_middleware prepends, so CORSMiddleware must be added last to wrap the
     # error middleware and put CORS headers on sanitized 500 responses too.
     app.add_middleware(SafeErrorMiddleware)
