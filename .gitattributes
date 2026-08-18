@@ -4,6 +4,11 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 
+# Container files are only ever consumed by Linux builders.
+Dockerfile text eol=lf
+*.conf text eol=lf
+.dockerignore text eol=lf
+
 # Prettier and Ruff both emit LF; pin these so Git does not rewrite them to CRLF
 # on Windows checkouts and reintroduce format-check failures.
 *.ts text eol=lf

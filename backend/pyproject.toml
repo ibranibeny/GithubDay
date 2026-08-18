@@ -35,6 +35,10 @@ packages = ["src/cost_copilot"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["integration: needs the built container listening on localhost; run with -m integration"]
+# The integration suite talks to a running container, so the default run (unit +
+# contract) stays offline; CI opts in with `pytest -m integration` once compose is up.
+addopts = ["-m", "not integration"]
 
 [tool.coverage.run]
 source = ["src/cost_copilot"]

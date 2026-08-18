@@ -1,0 +1,38 @@
+# Local/CI composition of the two images. Values below are placeholders: real
+# tenant, client and connection-string values come from the environment (or a
+# local .env that is never committed).
+services:
+  api:
+    build:
+      context: ./backend
+    image: azure-cost-copilot-api:local
+    ports:
+      - "8000:8000"
+    environment:
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-00000000-0000-0000-0000-000000000000}
+      AZURE_SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:-00000000-0000-0000-0000-000000000000}
+      ENTRA_API_CLIENT_ID: ${ENTRA_API_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
+      FOUNDRY_ENDPOINT: ${FOUNDRY_ENDPOINT:-https://example.openai.azure.com/openai/v1/}
+      FOUNDRY_DEPLOYMENT: ${FOUNDRY_DEPLOYMENT:-gpt-5.4-mini}
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-local}
+      # The browser origin is the web service below, not the Vite dev server.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+      APPLICATIONINSIGHTS_CONNECTION_STRING: ${APPLICATIONINSIGHTS_CONNECTION_STRING:-}
+
+  web:
+    build:
+      context: ./frontend
+    image: azure-cost-copilot-web:local
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-local}
+      ENTRA_TENANT_ID: ${AZURE_TENANT_ID:-00000000-0000-0000-0000-000000000000}
+      ENTRA_SPA_CLIENT_ID: ${ENTRA_SPA_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
+      ENTRA_API_CLIENT_ID: ${ENTRA_API_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
+      # Reached from the browser, so it is the published host port, not a
+      # compose service name.
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8000}
+      APPLICATIONINSIGHTS_CONNECTION_STRING: ${APPLICATIONINSIGHTS_CONNECTION_STRING:-}
+    depends_on:
+      - api
