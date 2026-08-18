@@ -1,0 +1,218 @@
+# Staging deployment: build, deploy, and then prove the deployment works.
+#
+# `push` to `staging` is the only trigger. There is no manual dispatch here on
+# purpose - the commit on `staging` is the unit of promotion, so the artefact
+# that gets deployed is always identifiable by a branch head, never by whoever
+# clicked a button.
+#
+# The chain this workflow enforces:
+#
+#   1. build both images in the shared registry, tagged git-<sha>, with the
+#      commit stamped into an OCI label
+#   2. resolve those tags to immutable digests AND verify the label matches this
+#      commit, so a moved tag cannot smuggle in a different build
+#   3. deploy by digest, holding traffic back until the new revision is healthy
+#   4. verify the deployed environment (identity, least privilege, routing,
+#      private link, live endpoint, diagnostics, fresh telemetry)
+#   5. run the browser and live-API end-to-end suites against it
+#
+# Only when all five pass does `promote.yml` open the staging -> main pull
+# request. A failure at any step leaves production untouched.
+#
+# Authentication is OIDC only. `azure/login` exchanges the short-lived GitHub
+# token for an Azure token through a federated credential on the staging
+# user-assigned managed identity. There is no client secret, no `creds:` JSON
+# blob and no registry password anywhere in this repository - `az acr build`
+# and the Container Apps pull both run on that same identity.
+name: Deploy staging
+
+on:
+  push:
+    branches:
+      - staging
+
+# Read-only, plus the OIDC token. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+# One staging deployment at a time, and a newer commit wins: a queued run for a
+# commit that has already been superseded would deploy stale bytes.
+concurrency:
+  group: staging
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Binding the job to the `staging` GitHub Environment is what makes
+    # `vars.AZURE_CLIENT_ID` resolve to the staging deployment identity, and it
+    # is the same string as that identity's federated credential subject
+    # (`repo:<owner>/<repo>:environment:staging`).
+    environment:
+      name: staging
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # Environment variables win over infra/config/*.env in load_config, so a
+      # value set here overrides the file without editing it.
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      IMAGE_TAG: git-${{ github.sha }}
+      IMAGE_REVISION: ${{ github.sha }}
+      IMAGE_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve the staging configuration
+        # infra/config is the single source of truth for resource names. Reading
+        # it here means the workflow never carries a second, drifting copy.
+        run: |
+          set -Eeuo pipefail
+          # shellcheck source=infra/scripts/lib.sh
+          . infra/scripts/lib.sh
+          load_config infra/config/staging.env
+          load_config infra/config/shared.env
+          for key in \
+            ACR_NAME SHARED_RESOURCE_GROUP RESOURCE_GROUP \
+            FRONTEND_IMAGE_REPOSITORY BACKEND_IMAGE_REPOSITORY \
+            AFD_PROFILE_NAME AFD_ENDPOINT_NAME; do
+            printf '%s=%s\n' "${key}" "${!key}" >>"${GITHUB_ENV}"
+          done
+          printf 'tag        : %s\n' "${IMAGE_TAG}"
+          printf 'registry   : %s\n' "${ACR_NAME}"
+          printf 'environment: staging\n'
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build the API image in the shared registry
+        # `az acr build` has no --label flag, so the commit reaches the image
+        # through a build argument that the Dockerfile turns into an OCI label.
+        # The mutable `staging` tag is a convenience for humans reading the
+        # registry; nothing in this pipeline ever deploys from it.
+        run: |
+          set -Eeuo pipefail
+          az acr build \
+            --registry "${ACR_NAME}" \
+            --image "${BACKEND_IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+            --image "${BACKEND_IMAGE_REPOSITORY}:staging" \
+            --file Dockerfile \
+            --build-arg "IMAGE_REVISION=${IMAGE_REVISION}" \
+            --build-arg "IMAGE_SOURCE=${IMAGE_SOURCE}" \
+            --build-arg "IMAGE_CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            ./backend
+
+      - name: Build the web image in the shared registry
+        run: |
+          set -Eeuo pipefail
+          az acr build \
+            --registry "${ACR_NAME}" \
+            --image "${FRONTEND_IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+            --image "${FRONTEND_IMAGE_REPOSITORY}:staging" \
+            --file Dockerfile \
+            --build-arg "IMAGE_REVISION=${IMAGE_REVISION}" \
+            --build-arg "IMAGE_SOURCE=${IMAGE_SOURCE}" \
+            --build-arg "IMAGE_CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            ./frontend
+
+      - name: Resolve the images to digests and check their provenance
+        # Fails unless both images carry org.opencontainers.image.revision equal
+        # to this commit, so a tag moved between the build and now is caught.
+        run: |
+          set -Eeuo pipefail
+          bash infra/scripts/resolve-digests.sh staging "${IMAGE_TAG}" "${IMAGE_REVISION}" >digests.json
+          printf 'FRONTEND_IMAGE=%s\n' "$(jq -r '.frontend.image' digests.json)" >>"${GITHUB_ENV}"
+          printf 'BACKEND_IMAGE=%s\n' "$(jq -r '.backend.image' digests.json)" >>"${GITHUB_ENV}"
+          jq -r '"frontend: \(.frontend.image)", "backend : \(.backend.image)"' digests.json
+
+      - name: Deploy to staging
+        # deploy.sh refuses anything that is not <registry>/<repo>@sha256:<64
+        # hex>, shifts traffic only after the new revision reports healthy, and
+        # leaves the previous revision serving if it never does.
+        run: bash infra/scripts/deploy.sh staging "${FRONTEND_IMAGE}" "${BACKEND_IMAGE}"
+
+      - name: Verify the staging environment
+        run: bash infra/scripts/verify.sh staging "${FRONTEND_IMAGE}" "${BACKEND_IMAGE}"
+
+      - name: Resolve the staging Front Door hostname
+        env:
+          # Written by bootstrap-oidc.sh once the endpoint exists; the lookup
+          # below covers the first deployment, when it is still empty.
+          FRONTDOOR_HOSTNAME: ${{ vars.FRONTDOOR_HOSTNAME }}
+        run: |
+          set -Eeuo pipefail
+          host="${FRONTDOOR_HOSTNAME}"
+          if [ -z "${host}" ]; then
+            host="$(az afd endpoint show \
+              --endpoint-name "${AFD_ENDPOINT_NAME}" \
+              --profile-name "${AFD_PROFILE_NAME}" \
+              --resource-group "${SHARED_RESOURCE_GROUP}" \
+              --query hostName --output tsv | tr -d '\r')"
+          fi
+          if [ -z "${host}" ]; then
+            printf 'could not resolve the staging Front Door hostname\n' >&2
+            exit 1
+          fi
+          printf 'STAGING_BASE_URL=https://%s\n' "${host}" >>"${GITHUB_ENV}"
+          printf 'staging base url: https://%s\n' "${host}"
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies from the lockfile
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install the Chromium browser
+        # Browsers are never committed or cached into the repository; the runner
+        # fetches exactly the build this Playwright version expects.
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end suites
+        working-directory: frontend
+        env:
+          # ENTRA_API_CLIENT_ID together with STAGING_BASE_URL (exported to the
+          # job environment by the hostname step) is what un-skips
+          # tests/e2e/live-api.spec.ts. The token that spec needs comes from the
+          # ambient `az login` above - the OIDC federated identity - so no
+          # secret is passed here or stored anywhere.
+          ENTRA_API_CLIENT_ID: ${{ vars.ENTRA_API_CLIENT_ID }}
+        run: npm run test:e2e
+
+      - name: Upload the Playwright report
+        # Uploaded even when the suite fails - that is exactly when the trace,
+        # the screenshots and the HTML report are worth having.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-staging
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Sign out of Azure
+        # Clears the cached token from the runner even when a step above failed.
+        if: always()
+        run: az logout || true

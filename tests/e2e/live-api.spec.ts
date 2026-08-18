@@ -96,15 +96,40 @@ test.describe("staging API", () => {
     const trend = await getJson<CostTrend>(request, "/api/costs/trend");
     const breakdown = await getJson<CostBreakdown>(request, "/api/costs/breakdown");
 
-    expect(summary.currency).toBe(EXPECTED_CURRENCY);
-    expect(trend.currency).toBe(EXPECTED_CURRENCY);
-    expect(breakdown.currency).toBe(EXPECTED_CURRENCY);
-
+    // Shape is unconditional: an empty period still has to answer with a
+    // well-formed result rather than a null, a string, or an error body.
     expect(Number.isFinite(summary.total)).toBe(true);
+    expect(Array.isArray(trend.points)).toBe(true);
+    expect(Array.isArray(breakdown.items)).toBe(true);
     expect(breakdown.grouping).toBe("ServiceName");
+    expect(Number.isFinite(breakdown.total)).toBe(true);
+    expect(Number.isFinite(breakdown.otherAmount)).toBe(true);
     // The ranked items plus the remainder are the same money the summary reports.
     const ranked = breakdown.items.reduce((sum, item) => sum + item.amount, 0);
     expect(ranked + breakdown.otherAmount).toBeCloseTo(breakdown.total, 2);
+
+    // Currency is only meaningful once there is money to denominate. A staging
+    // subscription in its first hours legitimately has no usage yet, and the
+    // Cost Management API reports no currency for an empty result - failing on
+    // that would make this gate a test of the subscription's age, not of the
+    // deployment.
+    expectCurrency("summary", summary, summary.total > 0);
+    expectCurrency("trend", trend, trend.points.length > 0);
+    expectCurrency(
+      "breakdown",
+      breakdown,
+      breakdown.items.length > 0 || breakdown.total > 0 || breakdown.otherAmount > 0,
+    );
+
+    // Whatever the three endpoints do report has to agree: one deployment
+    // reading one subscription cannot be billed in two currencies.
+    const reported = [summary.currency, trend.currency, breakdown.currency].filter(
+      (currency): currency is string => currency !== null && currency !== "",
+    );
+    expect(
+      new Set(reported).size,
+      `endpoints disagreed on currency: ${reported.join(", ")}`,
+    ).toBeLessThanOrEqual(1);
   });
 
   test("ignores a caller-supplied subscription: the scope is fixed server-side", async ({
@@ -193,4 +218,22 @@ test.describe("staging API", () => {
 /** Response bodies can quote account data, so only the path and status reach a message. */
 function whyItFailed(path: string, status: number): string {
   return `${path} should answer 200 (got ${status})`;
+}
+
+/**
+ * With data, the currency has to be the one staging is billed in. Without data there is nothing
+ * to denominate, so an absent currency is the correct answer and the only thing worth refusing
+ * is a *different* one.
+ */
+function expectCurrency(label: string, context: CostContext, hasData: boolean): void {
+  if (hasData) {
+    expect(context.currency, `${label} returned cost data, so it must report a currency`).toBe(
+      EXPECTED_CURRENCY,
+    );
+    return;
+  }
+  expect(
+    context.currency === null || context.currency === "" || context.currency === EXPECTED_CURRENCY,
+    `${label} returned no cost data, so its currency must be absent or ${EXPECTED_CURRENCY} (got ${String(context.currency)})`,
+  ).toBe(true);
 }

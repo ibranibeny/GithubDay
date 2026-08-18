@@ -19,6 +19,18 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 FROM nginxinc/nginx-unprivileged:1.29-alpine AS runtime
 
+# Provenance. `az acr build` has no --label flag, so the deployment workflow
+# passes these with --build-arg and infra/scripts/resolve-digests.sh refuses to
+# deploy an image whose revision label is not the commit being deployed.
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_SOURCE=https://github.com/ibranibeny/GithubDay
+ARG IMAGE_CREATED=1970-01-01T00:00:00Z
+
+LABEL org.opencontainers.image.title="azure-cost-copilot-web" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.created="${IMAGE_CREATED}"
+
 USER root
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
