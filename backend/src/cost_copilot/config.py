@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     foundry_endpoint: AnyHttpUrl
     foundry_deployment: str = "gpt-5.4-mini"
     applicationinsights_connection_string: str | None = None
+    app_environment: str = "local"
     allowed_origins: str = "http://localhost:5173"
 
     @field_validator("allowed_origins")

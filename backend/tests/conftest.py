@@ -23,6 +23,9 @@ for _optional in (
     "AZURE_CLIENT_ID",
     "FOUNDRY_DEPLOYMENT",
     "APPLICATIONINSIGHTS_CONNECTION_STRING",
+    "APP_ENVIRONMENT",
+    "GIT_SHA",
+    "OTEL_SERVICE_VERSION",
     "ALLOWED_ORIGINS",
 ):
     os.environ.pop(_optional, None)

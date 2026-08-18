@@ -123,5 +123,13 @@ def test_environment_variables_stay_primary(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.cors_origins == ["https://a.example", "https://b.example"]
 
 
+def test_the_deployment_environment_defaults_to_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert build_settings().app_environment == "local"
+
+    monkeypatch.setenv("APP_ENVIRONMENT", "prod")
+
+    assert build_settings().app_environment == "prod"
+
+
 def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()

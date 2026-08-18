@@ -3,17 +3,18 @@
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI
+import fastapi
 from fastapi.middleware.cors import CORSMiddleware
 
 from cost_copilot import __version__
 from cost_copilot.config import get_settings
 from cost_copilot.errors import SafeErrorMiddleware, register_exception_handlers
 from cost_copilot.routers import chat, costs, health
+from cost_copilot.telemetry import setup_telemetry
 
 
 @asynccontextmanager
-async def application_lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def application_lifespan(app: fastapi.FastAPI) -> AsyncIterator[None]:
     """Builds every upstream client once, in dependency order.
 
     The cost lifespan owns the shared Azure credential, so it is entered first
@@ -26,9 +27,13 @@ async def application_lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
 
 
-def create_app() -> FastAPI:
+def create_app() -> fastapi.FastAPI:
     settings = get_settings()
-    app = FastAPI(
+    # Azure Monitor rebinds `fastapi.FastAPI` to its instrumented subclass while it
+    # configures, so telemetry is set up first and the class is resolved from the
+    # module here rather than imported by name at the top of this file.
+    setup_telemetry(settings)
+    app = fastapi.FastAPI(
         title="Azure Cost Copilot API",
         version=__version__,
         lifespan=application_lifespan,

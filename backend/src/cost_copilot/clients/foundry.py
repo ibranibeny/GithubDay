@@ -60,6 +60,7 @@ from cost_copilot.models.chat import (
     ModelAnswer,
 )
 from cost_copilot.models.cost import CostGrouping, CostMetric
+from cost_copilot.telemetry import FOUNDRY_DEPENDENCY, dependency_span
 
 logger = logging.getLogger(__name__)
 
@@ -289,8 +290,18 @@ class FoundryChatClient:
         # The question and the data both travel as a JSON value in a user message,
         # so neither can be read as a system instruction.
         message: ResponseInputItemParam = {"role": "user", "content": content}
+        # Only the deployment name and the usage counters are traced. The question,
+        # the grounding, and the answer never leave this method.
+        with dependency_span(FOUNDRY_DEPENDENCY) as call:
+            call.record(model=self._model)
+            response = await self._create(message)
+            call.record(**_usage_attributes(getattr(response, "usage", None)))
+            return parse_model_output(response.output_text or "")
+
+    async def _create(self, message: ResponseInputItemParam) -> Any:
+        """One bounded request, with every provider failure mapped onto this module's errors."""
         try:
-            response = await self._client.responses.create(
+            return await self._client.responses.create(
                 model=self._model,
                 instructions=GROUNDING_INSTRUCTIONS,
                 input=[message],
@@ -318,7 +329,15 @@ class FoundryChatClient:
                 "The model deployment could not be authenticated"
             ) from error
 
-        return parse_model_output(response.output_text or "")
+
+def _usage_attributes(usage: Any) -> dict[str, int]:
+    """Token counters only; a response without a usage block simply reports none."""
+    counters = {}
+    for name in ("input_tokens", "output_tokens", "total_tokens"):
+        value = getattr(usage, name, None)
+        if isinstance(value, int):
+            counters[name] = value
+    return counters
 
 
 def _status_failure(error: APIStatusError) -> FoundryError:

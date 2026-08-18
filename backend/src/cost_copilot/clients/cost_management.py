@@ -31,6 +31,7 @@ from cost_copilot.clients.credentials import (
 )
 from cost_copilot.config import Settings
 from cost_copilot.models.cost import CostFilter, CostGrouping
+from cost_copilot.telemetry import COST_DEPENDENCY, dependency_span
 
 logger = logging.getLogger(__name__)
 
@@ -407,8 +408,12 @@ class CostManagementClient:
             await self._http.aclose()
 
     async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
-        payload = await self._fetch_all_pages(build_query(filters, granularity))
-        return parse_query_result(payload, grouping=requested_grouping(filters))
+        # Only the shape of the answer is traced; the rows themselves never are.
+        with dependency_span(COST_DEPENDENCY) as call:
+            payload = await self._fetch_all_pages(build_query(filters, granularity))
+            dataset = parse_query_result(payload, grouping=requested_grouping(filters))
+            call.record(row_count=len(dataset.records))
+            return dataset
 
     async def _authorization(self, deadline: _Deadline) -> str:
         remaining = deadline.remaining()
