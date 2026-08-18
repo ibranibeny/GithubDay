@@ -40,6 +40,7 @@ export function ChatPanel({ filter, currency, onApplyEvidence, onApplyAction }: 
   // Both gates run again here: the schema can only vouch for what came down this session's wire.
   const evidence = (latest?.evidence ?? []).filter(isEvidence);
   const actions = (latest?.chartActions ?? []).filter(isChartAction);
+  const blockedNoteId = `${ids}-blocked`;
 
   return (
     <div className={`assistant${reducedMotion ? " assistant--still" : ""}`}>
@@ -57,6 +58,8 @@ export function ChatPanel({ filter, currency, onApplyEvidence, onApplyAction }: 
             <span className="assistant__text">{message.text}</span>
           </li>
         ))}
+        {/* The wait is visible as a spinner-free busy button; this is the same fact, spoken. */}
+        {isPending ? <li className="visually-hidden">Thinking…</li> : null}
       </ol>
 
       {error ? (
@@ -109,6 +112,7 @@ export function ChatPanel({ filter, currency, onApplyEvidence, onApplyAction }: 
           rows={2}
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
+          aria-describedby={filter ? undefined : blockedNoteId}
         />
         <button
           type="submit"
@@ -119,7 +123,9 @@ export function ChatPanel({ filter, currency, onApplyEvidence, onApplyAction }: 
           Send
         </button>
         {filter ? null : (
-          <p className="assistant__note">Choose a period and a metric before asking a question.</p>
+          <p id={blockedNoteId} className="assistant__note">
+            Choose a period and a metric before asking a question.
+          </p>
         )}
       </form>
     </div>

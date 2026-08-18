@@ -21,6 +21,7 @@ import {
   buildCsvFileName,
   defaultCostFilter,
   downloadCsv,
+  monthFilter,
   toCsv,
   useCostData,
   type CostHighlight,
@@ -29,6 +30,18 @@ import {
 export interface CostDashboardProps {
   subscriptionName: string;
   initialFilter?: CostFilter;
+}
+
+/**
+ * The period control addresses whole calendar months, so a suggested window is widened to the
+ * month it starts in; an incomplete or inverted window is not a period and is left alone.
+ */
+function withWindow(filter: CostFilter, start?: string, end?: string): CostFilter {
+  if (!start || !end || end < start) {
+    return filter;
+  }
+  const month = monthFilter(start.slice(0, 7), filter.metric, filter.grouping, filter.tagKey);
+  return { ...filter, from: month.from, to: month.to };
 }
 
 export function CostDashboard({ subscriptionName, initialFilter }: CostDashboardProps) {
@@ -49,12 +62,9 @@ export function CostDashboard({ subscriptionName, initialFilter }: CostDashboard
     if (!isEvidence(evidence)) {
       return;
     }
-    setFilter((current) => ({
-      ...current,
-      metric: evidence.metric,
-      from: evidence.periodStart,
-      to: evidence.periodEnd,
-    }));
+    setFilter((current) =>
+      withWindow({ ...current, metric: evidence.metric }, evidence.periodStart, evidence.periodEnd),
+    );
     setHighlight({ grouping: filter.grouping, value: evidence.dimension });
   };
 
@@ -71,6 +81,12 @@ export function CostDashboard({ subscriptionName, initialFilter }: CostDashboard
       return;
     }
 
+    // A tag grouping without a key is a query the API always rejects, so it is not applied at
+    // all: half of it would silently change the grouping and break every panel.
+    if (action.grouping === "Tag" && !action.value) {
+      return;
+    }
+
     setFilter((current) => {
       const next: CostFilter = { ...current };
       if (action.metric) {
@@ -78,17 +94,10 @@ export function CostDashboard({ subscriptionName, initialFilter }: CostDashboard
       }
       if (action.grouping) {
         next.grouping = action.grouping;
-        // A tag grouping without a key is not a query the API accepts, so the value is only
-        // read as a tag key, never as a service or resource name.
+        // The value is only ever read as a tag key, never as a service or resource name.
         next.tagKey = action.grouping === "Tag" ? action.value : undefined;
       }
-      if (action.start) {
-        next.from = action.start;
-      }
-      if (action.end) {
-        next.to = action.end;
-      }
-      return next;
+      return withWindow(next, action.start, action.end);
     });
   };
 

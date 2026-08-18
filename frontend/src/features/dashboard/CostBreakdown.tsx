@@ -152,6 +152,12 @@ export function CostBreakdownPanel({
           </li>
         ) : null}
       </ol>
+      {/* The emphasis is a colour change, which nothing announces on its own. */}
+      {emphasised ? (
+        <p className="visually-hidden" role="status">
+          {emphasised} is highlighted in {label.toLowerCase()}.
+        </p>
+      ) : null}
     </section>
   );
 }

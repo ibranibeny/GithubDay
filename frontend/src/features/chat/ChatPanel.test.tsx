@@ -3,6 +3,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ApiForbiddenError, ApiHttpError, ApiNetworkError } from "../../api/client";
 import type { ChatResponse, CostFilter, Evidence } from "../../api/contracts";
 import { ChatPanel } from "./ChatPanel";
 import { ChatGatewayContext, type ChatGateway } from "./useCostChat";
@@ -36,7 +37,10 @@ function reply(overrides: Partial<ChatResponse> = {}): ChatResponse {
 
 function renderPanel(response: ChatResponse, filter: CostFilter | null = FILTER) {
   const send = vi.fn(() => Promise.resolve(response));
-  const gateway: ChatGateway = { send };
+  return { send, ...renderWithGateway({ send }, filter) };
+}
+
+function renderWithGateway(gateway: ChatGateway, filter: CostFilter | null = FILTER) {
   const onApplyEvidence = vi.fn();
   const onApplyAction = vi.fn();
   const client = new QueryClient({
@@ -56,7 +60,7 @@ function renderPanel(response: ChatResponse, filter: CostFilter | null = FILTER)
     </QueryClientProvider>,
   );
 
-  return { send, onApplyEvidence, onApplyAction };
+  return { onApplyEvidence, onApplyAction };
 }
 
 async function ask(user: ReturnType<typeof userEvent.setup>, prompt = "Why did cost rise?") {
@@ -180,5 +184,61 @@ describe("ChatPanel", () => {
       grouping: "ServiceName",
       value: "Azure App Service",
     });
+  });
+
+  it.each([
+    [
+      "a role problem",
+      new ApiForbiddenError("correlation-1"),
+      "You do not have access to the cost assistant for this subscription.",
+    ],
+    [
+      "an unreachable API",
+      new ApiNetworkError("correlation-1"),
+      "The assistant could not be reached. Check your connection and ask again.",
+    ],
+    [
+      "a rejected filter",
+      new ApiHttpError(422, "correlation-1"),
+      "The assistant needs a period, a metric, and a grouping. Adjust the filters and ask again.",
+    ],
+    [
+      "anything else",
+      new Error("upstream said why did my cost rise"),
+      "The assistant could not answer that. Ask again, or narrow the period.",
+    ],
+  ])("describes %s without quoting the failure", async (_case, failure, expected) => {
+    const user = userEvent.setup();
+    renderWithGateway({ send: () => Promise.reject(failure) });
+
+    await ask(user);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(expected);
+    expect(alert.textContent).not.toContain("why did my cost rise");
+  });
+
+  it("points the prompt at the reason sending is blocked", () => {
+    renderPanel(reply(), null);
+
+    const prompt = screen.getByLabelText(PROMPT_LABEL);
+    const describedBy = prompt.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy as string)).toHaveTextContent(
+      "Choose a period and a metric before asking a question.",
+    );
+  });
+
+  it("announces that the assistant is working while the answer is pending", async () => {
+    const user = userEvent.setup();
+    renderWithGateway({ send: () => new Promise<ChatResponse>(() => {}) });
+
+    await ask(user);
+
+    const log = await screen.findByRole("log");
+    await waitFor(() => {
+      expect(log).toHaveTextContent("Thinking");
+    });
+    expect(screen.getByRole("button", { name: "Send" })).toHaveAttribute("aria-busy", "true");
   });
 });

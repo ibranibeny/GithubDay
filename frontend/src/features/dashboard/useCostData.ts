@@ -1,9 +1,10 @@
 import { useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { createContext, useContext } from "react";
 
-import { ApiForbiddenError, ApiHttpError, apiFetch } from "../../api/client";
+import { ApiError, ApiForbiddenError, ApiHttpError, apiFetch } from "../../api/client";
 import type { CostFilter, CostGrouping } from "../../api/contracts";
 import { getAccessToken } from "../../auth/msal";
+import { trackApiFailure } from "../../telemetry/app-insights";
 
 /** Cost data is rerated hourly at best, so a five minute window is generous, not stale. */
 const STALE_TIME_MS = 5 * 60 * 1000;
@@ -113,19 +114,33 @@ function toQuery(filter: CostFilter, grouping: CostGrouping): string {
   return params.toString();
 }
 
+/**
+ * Reported with the id that went out on the wire, so the browser record and the server span of
+ * the same call can be joined. Only the correlator and the status code leave the browser.
+ */
+function reportApiFailure(error: unknown): never {
+  if (error instanceof ApiError) {
+    trackApiFailure({
+      correlationId: error.correlationId,
+      status: error instanceof ApiHttpError ? error.status : undefined,
+    });
+  }
+  throw error;
+}
+
 export const liveCostGateway: CostGateway = {
   fetchSummary: (filter, signal) =>
     apiFetch<CostSummaryResponse>(
       `/api/costs/summary?${toQuery(filter, filter.grouping)}`,
       getAccessToken,
       { signal },
-    ),
+    ).catch(reportApiFailure),
   fetchTrend: (filter, signal) =>
     apiFetch<CostTrendResponse>(
       `/api/costs/trend?${toQuery(filter, filter.grouping)}`,
       getAccessToken,
       { signal },
-    ),
+    ).catch(reportApiFailure),
   fetchBreakdown: (filter, grouping, signal) =>
     apiFetch<CostBreakdownResponse>(
       `/api/costs/breakdown?${toQuery(filter, grouping)}`,
@@ -133,7 +148,7 @@ export const liveCostGateway: CostGateway = {
       {
         signal,
       },
-    ),
+    ).catch(reportApiFailure),
 };
 
 export const CostDataContext = createContext<CostGateway>(liveCostGateway);

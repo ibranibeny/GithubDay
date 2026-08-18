@@ -116,6 +116,26 @@ function makeGateway(overrides: Partial<CostSummaryResponse> = {}): FakeGateway 
 
 const IDLE_CHAT: ChatGateway = { send: () => new Promise(() => {}) };
 
+function chatReplying(chartActions: unknown[]): ChatGateway {
+  return {
+    send: () =>
+      Promise.resolve({
+        answer: "Here is what the data shows.",
+        evidence: [],
+        chartActions,
+        explanationAvailable: true,
+      } as Awaited<ReturnType<ChatGateway["send"]>>),
+  };
+}
+
+/** Asks a question, then applies the single action the reply carried. */
+async function applyFirstAction(user: ReturnType<typeof userEvent.setup>) {
+  await user.type(screen.getByLabelText("Ask about these costs"), "What changed?");
+  await user.click(screen.getByRole("button", { name: "Send" }));
+  const actions = await screen.findByRole("group", { name: "Chart actions" });
+  await user.click(within(actions).getAllByRole("button")[0]);
+}
+
 function renderDashboard(gateway: CostGateway, chat: ChatGateway = IDLE_CHAT) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
@@ -402,6 +422,67 @@ describe("CostDashboard", () => {
     const emphasised = services.querySelectorAll('[data-emphasised="true"]');
     expect(emphasised).toHaveLength(1);
     expect(emphasised[0]).toHaveTextContent("Azure App Service");
+  });
+
+  it("announces the series the assistant emphasised", async () => {
+    const user = userEvent.setup();
+    renderDashboard(
+      makeGateway(),
+      chatReplying([
+        { kind: "highlight-series", grouping: "ServiceName", value: "Azure App Service" },
+      ]),
+    );
+    await waitForLoaded();
+    await applyFirstAction(user);
+
+    const services = screen.getByRole("region", { name: "Service name" });
+    expect(within(services).getByRole("status")).toHaveTextContent("Azure App Service");
+  });
+
+  it("ignores a tag grouping the API would always reject", async () => {
+    const user = userEvent.setup();
+    const gateway = makeGateway();
+    renderDashboard(gateway, chatReplying([{ kind: "set-filter", grouping: "Tag" }]));
+    await waitForLoaded();
+    await applyFirstAction(user);
+
+    expect(screen.getByLabelText("Group by")).toHaveValue("ServiceName");
+    for (const call of gateway.fetchSummary.mock.calls) {
+      expect(call[0].grouping).not.toBe("Tag");
+    }
+  });
+
+  it("ignores a suggested period whose end precedes its start", async () => {
+    const user = userEvent.setup();
+    renderDashboard(
+      makeGateway(),
+      chatReplying([{ kind: "set-filter", start: "2026-07-31", end: "2026-07-01" }]),
+    );
+    await waitForLoaded();
+    await applyFirstAction(user);
+
+    expect(screen.getByLabelText("Period")).toHaveValue("2026-08");
+  });
+
+  it("widens a suggested period to the month the period control can show", async () => {
+    const user = userEvent.setup();
+    const gateway = makeGateway();
+    renderDashboard(
+      gateway,
+      chatReplying([{ kind: "set-filter", start: "2026-06-05", end: "2026-06-20" }]),
+    );
+    await waitForLoaded();
+    await applyFirstAction(user);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Period")).toHaveValue("2026-06");
+    });
+    await waitFor(() => {
+      expect(gateway.fetchSummary).toHaveBeenCalledWith(
+        expect.objectContaining({ from: "2026-06-01", to: "2026-06-30" }),
+        expect.anything(),
+      );
+    });
   });
 });
 

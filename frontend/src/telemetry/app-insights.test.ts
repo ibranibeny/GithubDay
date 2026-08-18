@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { initAppInsights, sanitizeTelemetryItem, trackWebVitals } from "./app-insights";
+import {
+  initAppInsights,
+  sanitizeTelemetryItem,
+  trackApiFailure,
+  trackWebVitals,
+} from "./app-insights";
 
 const hoisted = vi.hoisted(() => {
   const instances: {
@@ -8,6 +13,7 @@ const hoisted = vi.hoisted(() => {
     loadAppInsights: ReturnType<typeof vi.fn>;
     addTelemetryInitializer: ReturnType<typeof vi.fn>;
     trackMetric: ReturnType<typeof vi.fn>;
+    trackEvent: ReturnType<typeof vi.fn>;
   }[] = [];
 
   const ApplicationInsights = vi.fn(function (options: { config: Record<string, unknown> }) {
@@ -16,6 +22,7 @@ const hoisted = vi.hoisted(() => {
       loadAppInsights: vi.fn(),
       addTelemetryInitializer: vi.fn(),
       trackMetric: vi.fn(),
+      trackEvent: vi.fn(),
     };
     instances.push(instance);
     return instance;
@@ -76,6 +83,18 @@ describe("initAppInsights", () => {
     expect(instance.config.disableFetchTracking).toBe(false);
     expect(instance.loadAppInsights).toHaveBeenCalledTimes(1);
     expect(instance.addTelemetryInitializer).toHaveBeenCalledTimes(1);
+  });
+
+  it("correlates browser calls with the API so a trace spans both", () => {
+    initAppInsights({
+      ...BASE_CONFIG,
+      environment: "workshop",
+      appInsightsConnectionString: CONNECTION_STRING,
+    });
+
+    const instance = hoisted.instances[0];
+    expect(instance.config.enableCorsCorrelation).toBe(true);
+    expect(instance.config.correlationHeaderDomains).toEqual(["api.example.test"]);
   });
 
   it("registers an initializer that strips prompts, answers, and credentials", () => {
@@ -160,10 +179,52 @@ describe("trackWebVitals", () => {
   });
 });
 
+describe("trackApiFailure", () => {
+  it("does nothing when telemetry was never initialised", async () => {
+    vi.resetModules();
+    const fresh = await import("./app-insights");
+    expect(() =>
+      fresh.trackApiFailure({ correlationId: "correlation-1", status: 503 }),
+    ).not.toThrow();
+    expect(hoisted.instances).toHaveLength(0);
+  });
+
+  it("reports only the correlation id and the status", () => {
+    initAppInsights({
+      ...BASE_CONFIG,
+      environment: "workshop",
+      appInsightsConnectionString: CONNECTION_STRING,
+    });
+
+    trackApiFailure({ correlationId: "correlation-1", status: 503 });
+    expect(hoisted.instances[0].trackEvent).toHaveBeenCalledWith(
+      { name: "api_failure" },
+      { correlationId: "correlation-1", status: 503 },
+    );
+
+    trackApiFailure({ correlationId: "correlation-2" });
+    expect(hoisted.instances[0].trackEvent).toHaveBeenLastCalledWith(
+      { name: "api_failure" },
+      { correlationId: "correlation-2" },
+    );
+  });
+});
+
 describe("sanitizeTelemetryItem", () => {
   it("leaves telemetry without custom data untouched", () => {
     const item = { name: "pageView" };
     expect(() => sanitizeTelemetryItem(item, "workshop")).not.toThrow();
     expect(item).toEqual({ name: "pageView" });
+  });
+
+  it("drops custom measurements so no cost figure leaves as a number", () => {
+    const item = {
+      name: "event",
+      baseData: { measurements: { amount: 1620.4, evidenceCount: 2 } },
+    };
+
+    sanitizeTelemetryItem(item, "workshop");
+
+    expect(item.baseData.measurements).toEqual({});
   });
 });
