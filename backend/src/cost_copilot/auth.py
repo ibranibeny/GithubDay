@@ -6,13 +6,13 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from functools import lru_cache
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Protocol, cast
 from uuid import UUID
 
 import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jwt import PyJWK, PyJWKClient
+from jwt import PyJWK, PyJWKClient, PyJWKSet
 from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError, PyJWTError
 
 from cost_copilot.config import Settings, get_settings
@@ -96,6 +96,11 @@ def unverified_kid(token: str) -> str | None:
     return kid if isinstance(kid, str) else None
 
 
+def _await_jwks_refresh(refresh_done: threading.Event) -> None:
+    """Block until the in-flight JWKS refresh finishes, bounded by the fetch timeout."""
+    refresh_done.wait(JWKS_TIMEOUT_SECONDS)
+
+
 class EntraSigningKeyResolver:
     """Fetches signing keys from the tenant JWKS endpoint.
 
@@ -104,6 +109,13 @@ class EntraSigningKeyResolver:
     traffic by varying the `kid` on every request. Two limits close that off: a
     per-kid negative cache, and a global cooldown that caps forced refreshes to
     one per window no matter how many distinct key ids arrive.
+
+    The cooldown alone would reject legitimate tokens whenever the cache is cold
+    or has just expired, because then *every* kid misses the cached set and only
+    one caller could claim the window. So the refresh is single-flight instead of
+    fail-fast: one caller leads it and the rest wait on its result before
+    deciding, which keeps the outbound bound at one refresh per window while
+    still admitting concurrent valid callers.
     """
 
     def __init__(
@@ -113,6 +125,7 @@ class EntraSigningKeyResolver:
         key_lookup: Callable[[str], SigningKey] | None = None,
         cached_key_ids: Callable[[], set[str]] | None = None,
         time_source: Callable[[], float] = time.monotonic,
+        refresh_waiter: Callable[[threading.Event], None] | None = None,
     ) -> None:
         self.jwks_uri = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
         self.jwks_client = PyJWKClient(
@@ -125,42 +138,56 @@ class EntraSigningKeyResolver:
         self._lookup = key_lookup or self.jwks_client.get_signing_key_from_jwt
         self._cached_key_ids = cached_key_ids or self.signing_key_ids_in_cache
         self._now = time_source
+        self._await_refresh = refresh_waiter or _await_jwks_refresh
         self._unknown_kids = UnknownKidCache(time_source=time_source)
         self._refresh_lock = threading.Lock()
         self._last_forced_refresh: float | None = None
+        self._refresh_in_flight: threading.Event | None = None
 
     def signing_key_ids_in_cache(self) -> set[str]:
         """Key ids already held locally, filtered the way PyJWKClient filters them.
 
-        Reads only the cache: an empty or expired cache reads as empty rather
-        than triggering the fetch this class exists to ration.
+        A single cache read decides the answer: routing back through
+        `get_jwk_set()` would let an expiry between the check and the read fall
+        through to the fetch this class exists to ration.
         """
         cache = self.jwks_client.jwk_set_cache
-        if cache is None or cache.get() is None:
+        # JWKSetCache is annotated as holding a PyJWKSet, but fetch_data() stores
+        # the raw decoded JSON, which is what get_jwk_set() then parses.
+        cached = cast(Any, cache.get()) if cache is not None else None
+        if not isinstance(cached, dict):
             return set()
         return {
             key.key_id
-            for key in self.jwks_client.get_jwk_set().keys
+            for key in PyJWKSet.from_dict(cached).keys
             if key.key_id and key.public_key_use in ("sig", None)
         }
 
-    def _claim_forced_refresh(self) -> bool:
-        """Grant at most one JWKS refetch per cooldown, across every caller and kid."""
+    def _claim_forced_refresh(self) -> tuple[bool, threading.Event | None]:
+        """Elect one leader per cooldown window; report what everyone else may wait on.
+
+        Returns `(is_leader, refresh_done)`. A `None` event means no refresh is in
+        flight and the cooldown has not elapsed, so there is nothing to ride.
+        """
         now = self._now()
         with self._refresh_lock:
+            if self._refresh_in_flight is not None:
+                return False, self._refresh_in_flight
             last = self._last_forced_refresh
             if last is not None and now - last < JWKS_FORCED_REFRESH_COOLDOWN_SECONDS:
-                return False
+                return False, None
             self._last_forced_refresh = now
-            return True
+            self._refresh_in_flight = threading.Event()
+            return True, self._refresh_in_flight
 
-    def __call__(self, token: str) -> SigningKey:
-        kid = unverified_kid(token)
-        if kid is not None and self._unknown_kids.is_denied(kid):
-            raise UnknownSigningKeyError("Signing key id was rejected by a recent lookup")
-        # A missing kid also misses the cached set, so it is rationed the same way.
-        if (kid is None or kid not in self._cached_key_ids()) and not self._claim_forced_refresh():
-            raise UnknownSigningKeyError("Signing key id is uncached and refresh is throttled")
+    def _release_forced_refresh(self) -> None:
+        """Wake the followers, including when the leader's fetch failed."""
+        with self._refresh_lock:
+            refresh_done, self._refresh_in_flight = self._refresh_in_flight, None
+        if refresh_done is not None:
+            refresh_done.set()
+
+    def _lookup_and_record(self, token: str, kid: str | None) -> SigningKey:
         try:
             return self._lookup(token)
         except PyJWKClientError as error:
@@ -169,6 +196,35 @@ class EntraSigningKeyResolver:
             if kid is not None and not isinstance(error, PyJWKClientConnectionError):
                 self._unknown_kids.record(kid)
             raise
+
+    def _resolve_without_refreshing(
+        self, token: str, kid: str | None, refresh_done: threading.Event | None
+    ) -> SigningKey:
+        """Ride an in-flight refresh rather than starting one or failing outright.
+
+        A leader that fails still releases the event, so a bounded wait plus a
+        pure cache re-read fails closed instead of falling back to a fetch.
+        """
+        if refresh_done is not None:
+            self._await_refresh(refresh_done)
+        if kid is not None and kid in self._cached_key_ids():
+            return self._lookup_and_record(token, kid)
+        raise UnknownSigningKeyError("Signing key id is uncached and refresh is throttled")
+
+    def __call__(self, token: str) -> SigningKey:
+        kid = unverified_kid(token)
+        if kid is not None and self._unknown_kids.is_denied(kid):
+            raise UnknownSigningKeyError("Signing key id was rejected by a recent lookup")
+        # A missing kid also misses the cached set, so it is rationed the same way.
+        if kid is None or kid not in self._cached_key_ids():
+            is_leader, refresh_done = self._claim_forced_refresh()
+            if not is_leader:
+                return self._resolve_without_refreshing(token, kid, refresh_done)
+            try:
+                return self._lookup_and_record(token, kid)
+            finally:
+                self._release_forced_refresh()
+        return self._lookup_and_record(token, kid)
 
 
 @lru_cache
