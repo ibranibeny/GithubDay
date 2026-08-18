@@ -5,7 +5,7 @@ import { usePrefersReducedMotion } from "../../app/usePrefersReducedMotion";
 import { CHART_PALETTE, buildDonutOption } from "./chartOptions";
 import { formatCurrency, formatPercent } from "./format";
 import { DONUT_CHART_HEIGHT } from "./layout";
-import { DIMENSION_LABELS, type BreakdownQuery } from "./useCostData";
+import { DIMENSION_LABELS, type BreakdownQuery, type CostHighlight } from "./useCostData";
 
 const SLOT_STYLE = { height: `${DONUT_CHART_HEIGHT}px` };
 const FILL_STYLE = { height: "100%", width: "100%" };
@@ -15,6 +15,7 @@ export interface CostBreakdownGridProps {
   breakdowns: BreakdownQuery[];
   currency: string;
   activeDimension: CostGrouping;
+  highlight?: CostHighlight | null;
   onFocusDimension: (dimension: CostGrouping) => void;
 }
 
@@ -22,6 +23,7 @@ export function CostBreakdownGrid({
   breakdowns,
   currency,
   activeDimension,
+  highlight = null,
   onFocusDimension,
 }: CostBreakdownGridProps) {
   return (
@@ -32,6 +34,7 @@ export function CostBreakdownGrid({
           breakdown={breakdown}
           currency={currency}
           isActive={breakdown.dimension === activeDimension}
+          highlight={highlight}
           onFocusDimension={onFocusDimension}
         />
       ))}
@@ -43,6 +46,7 @@ export interface CostBreakdownPanelProps {
   breakdown: BreakdownQuery;
   currency: string;
   isActive: boolean;
+  highlight?: CostHighlight | null;
   onFocusDimension: (dimension: CostGrouping) => void;
 }
 
@@ -50,12 +54,14 @@ export function CostBreakdownPanel({
   breakdown,
   currency,
   isActive,
+  highlight = null,
   onFocusDimension,
 }: CostBreakdownPanelProps) {
   const reducedMotion = usePrefersReducedMotion();
   const { dimension, query } = breakdown;
   const label = DIMENSION_LABELS[dimension];
   const items = query.data?.items.slice(0, LEGEND_LIMIT) ?? [];
+  const emphasised = highlight?.grouping === dimension ? highlight.value : null;
 
   return (
     <section
@@ -112,8 +118,13 @@ export function CostBreakdownPanel({
               <span className="ranked__share num">{formatPercent(item.percentage)}</span>
             </>
           );
+          const isEmphasised = item.name === emphasised;
           return (
-            <li key={item.name}>
+            <li
+              key={item.name}
+              className={isEmphasised ? "ranked__item--emphasised" : undefined}
+              data-emphasised={isEmphasised ? "true" : undefined}
+            >
               {/* Already the grouping, so the row would be a no-op: it stops being a control. */}
               {isActive ? (
                 <div className="ranked__row ranked__row--static">{cells}</div>

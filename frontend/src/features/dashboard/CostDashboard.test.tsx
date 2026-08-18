@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import { ApiForbiddenError, ApiHttpError } from "../../api/client";
 import type { CostFilter, CostGrouping } from "../../api/contracts";
 import tokensCss from "../../styles/tokens.css?raw";
+import { ChatGatewayContext, type ChatGateway } from "../chat/useCostChat";
 import { CostDashboard } from "./CostDashboard";
 import {
   AXIS_LABEL_COLOR,
@@ -113,15 +114,19 @@ function makeGateway(overrides: Partial<CostSummaryResponse> = {}): FakeGateway 
   };
 }
 
-function renderDashboard(gateway: CostGateway) {
+const IDLE_CHAT: ChatGateway = { send: () => new Promise(() => {}) };
+
+function renderDashboard(gateway: CostGateway, chat: ChatGateway = IDLE_CHAT) {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <CostDataContext.Provider value={gateway}>
-        <CostDashboard subscriptionName="Contoso Workshop" initialFilter={FILTER} />
-      </CostDataContext.Provider>
+      <ChatGatewayContext.Provider value={chat}>
+        <CostDataContext.Provider value={gateway}>
+          <CostDashboard subscriptionName="Contoso Workshop" initialFilter={FILTER} />
+        </CostDataContext.Provider>
+      </ChatGatewayContext.Provider>
     </QueryClientProvider>,
   );
 }
@@ -355,6 +360,48 @@ describe("CostDashboard", () => {
     expect(screen.getByRole("button", { name: "Download CSV" })).toHaveFocus();
 
     expect(tokensCss).toMatch(/:focus-visible\s*\{[^}]*outline:/);
+  });
+
+  it("moves the period, the metric, and the emphasis when chat evidence is applied", async () => {
+    const user = userEvent.setup();
+    const chat: ChatGateway = {
+      send: vi.fn(() =>
+        Promise.resolve({
+          answer: "App Service led July.",
+          evidence: [
+            {
+              metric: "AmortizedCost" as const,
+              dimension: "Azure App Service",
+              periodStart: "2026-07-01",
+              periodEnd: "2026-07-31",
+              amount: 1620.4,
+            },
+          ],
+          chartActions: [],
+          explanationAvailable: true,
+        }),
+      ),
+    };
+    renderDashboard(makeGateway(), chat);
+    await waitForLoaded();
+
+    await user.type(screen.getByLabelText("Ask about these costs"), "What led July?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Apply Amortized cost for Azure App Service, 2026-07-01 to 2026-07-31",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Period")).toHaveValue("2026-07");
+    });
+    expect(screen.getByLabelText("Metric")).toHaveValue("AmortizedCost");
+
+    const services = screen.getByRole("region", { name: "Service name" });
+    const emphasised = services.querySelectorAll('[data-emphasised="true"]');
+    expect(emphasised).toHaveLength(1);
+    expect(emphasised[0]).toHaveTextContent("Azure App Service");
   });
 });
 

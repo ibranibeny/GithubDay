@@ -65,7 +65,7 @@ export interface ApiFetchOptions {
  * preview, a proxy that terminates TLS elsewhere) would otherwise throw before every
  * request. The value is a trace correlator, never a token or a nonce.
  */
-function newCorrelationId(): string {
+export function newCorrelationId(): string {
   const webCrypto = typeof crypto === "undefined" ? undefined : crypto;
   if (typeof webCrypto?.randomUUID === "function") {
     return webCrypto.randomUUID();

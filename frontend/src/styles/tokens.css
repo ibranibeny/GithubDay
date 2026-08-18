@@ -219,6 +219,197 @@ body {
   color: var(--ink-3);
 }
 
+/* ------------------------------------------------------------ assistant */
+
+.assistant {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  height: 100%;
+  min-height: 0;
+}
+
+.assistant__log {
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  min-height: 120px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.assistant__hint {
+  padding: var(--space-3);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  color: var(--ink-3);
+}
+
+.assistant__turn {
+  display: grid;
+  gap: 2px;
+  margin-bottom: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+}
+
+.assistant__turn--user {
+  background: var(--azure-soft);
+  border-color: transparent;
+}
+
+.assistant__role {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.assistant__text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.assistant__error {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-panel);
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.assistant__note {
+  margin: 0;
+  color: var(--ink-3);
+}
+
+.assistant__evidence ul {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.evidence {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0 var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--azure);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.evidence:hover {
+  background: var(--azure-soft);
+}
+
+.evidence__dimension {
+  overflow-wrap: anywhere;
+}
+
+.evidence__period {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+.assistant__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.assistant__action {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink-2);
+  font: inherit;
+  cursor: pointer;
+}
+
+.assistant__action:hover {
+  border-color: var(--azure);
+  color: var(--azure);
+}
+
+.assistant__compose {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.assistant__label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.assistant__input {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  resize: vertical;
+}
+
+.assistant__send {
+  justify-self: start;
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--azure);
+  border-radius: var(--radius);
+  background: var(--azure);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.assistant__send:disabled {
+  border-color: var(--line);
+  background: var(--canvas);
+  color: var(--ink-3);
+  cursor: not-allowed;
+}
+
+.assistant__send[aria-busy="true"] {
+  animation: assistant-pulse 1.2s ease-in-out infinite;
+}
+
+/* The pulse is the only motion here, so honouring the preference is a single rule. */
+.assistant--still .assistant__send[aria-busy="true"] {
+  animation: none;
+}
+
+@keyframes assistant-pulse {
+  50% {
+    opacity: 0.6;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .assistant__send[aria-busy="true"] {
+    animation: none;
+  }
+}
+
 /* ----------------------------------------------------------- page head */
 
 .page {
@@ -564,6 +755,13 @@ body {
 
 .ranked li:first-child {
   border-top: 0;
+}
+
+/* Emphasis the assistant asked for. Weight and a rule, not colour alone. */
+.ranked__item--emphasised {
+  box-shadow: inset 2px 0 0 var(--azure);
+  background: var(--azure-soft);
+  font-weight: 600;
 }
 
 .ranked__row,

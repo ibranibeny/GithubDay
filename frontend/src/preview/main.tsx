@@ -2,7 +2,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
-import { AppShell } from "../app/AppShell";
 import { CostDashboard } from "../features/dashboard/CostDashboard";
 import { CostDataContext } from "../features/dashboard/useCostData";
 import "../styles/tokens.css";
@@ -25,9 +24,7 @@ createRoot(container).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <CostDataContext.Provider value={previewGateway}>
-        <AppShell>
-          <CostDashboard subscriptionName="Contoso Workshop" initialFilter={PREVIEW_FILTER} />
-        </AppShell>
+        <CostDashboard subscriptionName="Contoso Workshop" initialFilter={PREVIEW_FILTER} />
       </CostDataContext.Provider>
     </QueryClientProvider>
   </StrictMode>,

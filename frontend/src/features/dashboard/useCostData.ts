@@ -32,6 +32,12 @@ export const METRIC_LABELS = {
   AmortizedCost: "Amortized cost",
 } as const;
 
+/** Transient emphasis driven by the assistant; a target that is absent is simply not drawn. */
+export interface CostHighlight {
+  grouping: CostGrouping;
+  value: string;
+}
+
 export interface CostChange {
   amount: number;
   percentage: number | null;
