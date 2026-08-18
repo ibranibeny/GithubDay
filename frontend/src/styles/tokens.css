@@ -256,6 +256,9 @@ body {
   gap: var(--space-2);
   flex-wrap: wrap;
   justify-content: flex-end;
+  /* Cap the column so the freshness note wraps here instead of stretching the
+     auto track and squeezing the title into a cramped, overlapping column. */
+  max-width: 340px;
 }
 
 .command {
@@ -741,6 +744,7 @@ body {
     grid-row: auto;
     justify-content: flex-start;
     padding-top: var(--space-2);
+    max-width: none;
   }
 
   .commandbar__note {
