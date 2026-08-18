@@ -313,3 +313,123 @@ check_azure_context() {
 require_azure_context() {
   check_azure_context || die "Azure CLI context guard failed; nothing was changed."
 }
+
+# ---------------------------------------------------------------------------
+# Mutating Azure CLI calls
+# ---------------------------------------------------------------------------
+
+# az_do runs a state-changing Azure CLI command.
+#
+# Every invocation is echoed to stderr, so never pass a secret through az_do
+# (shared keys, registry passwords, connection strings). Read those with azval
+# and hand them to the CLI some other way, or let the CLI resolve them itself.
+#
+# Setting DRY_RUN=1 prints the command and changes nothing. Callers must treat
+# the empty output that follows as "unknown", not as "resource has no id".
+az_do() {
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    log "DRY_RUN would run: az $*"
+    return 0
+  fi
+  log "az $*"
+  azval "$@"
+}
+
+# ensure_az_extension <name>... - install the Azure CLI extensions the
+# provisioning scripts need. Without this a non-interactive shell either
+# prompts for a dynamic install or fails outright.
+ensure_az_extension() {
+  local name
+  for name in "$@"; do
+    if azval extension show --name "$name" --query name --output tsv >/dev/null 2>&1; then
+      continue
+    fi
+    log "installing the Azure CLI extension ${name}"
+    az_do extension add --name "$name" --upgrade --only-show-errors --output none >/dev/null ||
+      die "could not install the Azure CLI extension ${name}"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Idempotency helpers
+# ---------------------------------------------------------------------------
+
+# ensure_tags <resource-id> <key=value>... - merge the required tags when at
+# least one of them is missing or holds a different value. Tags that were set
+# by someone else are left alone, so this never fights the portal.
+ensure_tags() {
+  local resource_id="${1:-}"
+  shift || true
+  if [ -z "$resource_id" ] || [ "$#" -eq 0 ]; then
+    return 0
+  fi
+
+  local current pair key value drift=0
+  current="$(azval tag list --resource-id "$resource_id" --output json 2>/dev/null || true)"
+  if [ -z "$current" ]; then
+    warn "could not read the tags of ${resource_id}; applying the required tags anyway"
+    current='{}'
+  fi
+
+  for pair in "$@"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    if [ "$(printf '%s' "$current" | jq -r --arg k "$key" '.properties.tags[$k] // ""')" != "$value" ]; then
+      drift=1
+      break
+    fi
+  done
+
+  if [ "$drift" -eq 0 ]; then
+    return 0
+  fi
+
+  log "updating tags on ${resource_id}"
+  az_do tag update --resource-id "$resource_id" --operation Merge --tags "$@" --output none >/dev/null
+}
+
+# ensure_role_assignment <principal-object-id> <role name> <scope>
+#
+# `az role assignment create` is create-only: a duplicate raises
+# RoleAssignmentExists and, with `set -e`, would abort a re-run. Look the
+# assignment up first, matching on principalId, role name and the exact scope
+# so an inherited assignment at a parent scope is not mistaken for this one.
+#
+# The lookup filters client side rather than with `--assignee` on purpose:
+# `--assignee` resolves the id through Microsoft Graph, which fails for a
+# freshly created managed identity and for callers without directory read.
+ensure_role_assignment() {
+  local principal_id="${1:?ensure_role_assignment requires a principal object id}"
+  local role="${2:?ensure_role_assignment requires a role name}"
+  local scope="${3:?ensure_role_assignment requires a scope}"
+  local existing attempt
+
+  existing="$(azval role assignment list \
+    --scope "$scope" \
+    --query "[?principalId=='${principal_id}' && roleDefinitionName=='${role}' && scope=='${scope}'].id" \
+    --output tsv 2>/dev/null || true)"
+  if [ -n "$existing" ]; then
+    ok "role '${role}' is already assigned to ${principal_id} at ${scope}"
+    return 0
+  fi
+
+  # A managed identity's service principal takes a few seconds to replicate
+  # through Entra ID, so retry the create a bounded number of times.
+  for attempt in 1 2 3; do
+    if az_do role assignment create \
+      --assignee-object-id "$principal_id" \
+      --assignee-principal-type ServicePrincipal \
+      --role "$role" \
+      --scope "$scope" \
+      --output none >/dev/null 2>&1; then
+      ok "assigned role '${role}' to ${principal_id} at ${scope}"
+      return 0
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      warn "role assignment '${role}' failed (attempt ${attempt}/3); retrying after Entra ID replication"
+      sleep "${ROLE_ASSIGNMENT_RETRY_DELAY:-10}"
+    fi
+  done
+
+  die "could not assign role '${role}' to ${principal_id} at ${scope}"
+}
