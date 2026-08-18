@@ -9,9 +9,11 @@ value here is located by column name and never by a fixed index.
 
 import asyncio
 import logging
+import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
+from time import monotonic
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -38,10 +40,14 @@ DAY_START = time(0, 0, 0, tzinfo=UTC)
 DAY_END = time(23, 59, 59, tzinfo=UTC)
 
 REQUEST_TIMEOUT_SECONDS = 30.0
+# One wall-clock budget for a whole query: without it a per-attempt timeout would
+# multiply across retries and pages, so a single request could hang for minutes.
+QUERY_DEADLINE_SECONDS = 75.0
 MAX_RETRIES = 3
 MAX_PAGES = 50
 BASE_RETRY_DELAY_SECONDS = 1.0
 MAX_RETRY_DELAY_SECONDS = 30.0
+RETRY_JITTER_FRACTION = 0.25
 RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 # 429 answers carry a Consumption-specific header; 503 answers use the standard one.
 RETRY_AFTER_HEADERS = ("x-ms-ratelimit-microsoft.consumption-retry-after", "retry-after")
@@ -80,6 +86,18 @@ class CostUpstreamError(CostQueryError):
 
 class CostResponseError(CostQueryError):
     """Cost Management answered with a body this client cannot trust."""
+
+
+@dataclass(frozen=True, slots=True)
+class _NoContent:
+    """A genuine 204: the query ran and there is nothing to bill.
+
+    Kept distinct from a decoded body so a 200 that lost its payload can never be
+    mistaken for "no cost".
+    """
+
+
+NO_CONTENT = _NoContent()
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,10 +155,9 @@ def query_url(subscription_id: UUID) -> str:
     )
 
 
-def _require_mapping(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+def _properties(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Money must fail closed: only a 204 means "nothing", never a body without properties."""
     properties = payload.get("properties")
-    if properties is None and "properties" not in payload:
-        return None  # a 204 answer, normalized to an empty payload upstream
     if not isinstance(properties, Mapping):
         raise CostResponseError("Cost Management response has no usable properties object")
     return properties
@@ -150,9 +167,7 @@ def _page_parts(
     payload: Mapping[str, Any],
 ) -> tuple[list[Mapping[str, Any]], list[Sequence[Any]], str | None]:
     """Split one response page into columns, rows, and the paging link."""
-    properties = _require_mapping(payload)
-    if properties is None:
-        return [], [], None
+    properties = _properties(payload)
 
     columns = properties.get("columns", [])
     if not isinstance(columns, list):
@@ -214,10 +229,13 @@ def _dimension_index(
     grouping: RequestedGrouping | None,
 ) -> int | None:
     if grouping is not None:
-        wanted = (
-            TAG_VALUE_COLUMN_NAMES if grouping.is_tag else frozenset({grouping.name.casefold()})
+        if grouping.is_tag:
+            # A TagKey column only repeats the key that was asked for, so when the
+            # answer carries no TagValue there is no label to bind at all.
+            return _named_index(names, types, TAG_VALUE_COLUMN_NAMES, STRING_COLUMN_TYPE)
+        requested = _named_index(
+            names, types, frozenset({grouping.name.casefold()}), STRING_COLUMN_TYPE
         )
-        requested = _named_index(names, types, wanted, STRING_COLUMN_TYPE)
         if requested is not None:
             return requested
     for index, column_type in enumerate(types):
@@ -239,12 +257,21 @@ def _parse_usage_date(value: Any) -> date:
 
 
 def _parse_amount(value: Any) -> float:
+    # A null cost is rejected rather than read as zero: an unknown charge must not
+    # silently understate a bill.
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise CostResponseError("Cost Management returned an unusable cost value")
     try:
         return float(value)
     except ValueError as error:
         raise CostResponseError("Cost Management returned an unusable cost value") from error
+
+
+def _normalized_currency(value: Any) -> str | None:
+    """ISO codes are compared case- and padding-insensitively; a blank cell says nothing."""
+    if not isinstance(value, str):
+        return None
+    return value.strip().upper() or None
 
 
 def parse_query_result(
@@ -268,7 +295,9 @@ def parse_query_result(
         if not isinstance(row, Sequence) or isinstance(row, str) or len(row) != len(columns):
             raise CostResponseError("Cost Management returned a row that does not match columns")
         if currency_index is not None:
-            currencies.add(str(row[currency_index]))
+            currency = _normalized_currency(row[currency_index])
+            if currency is not None:
+                currencies.add(currency)
         records.append(
             CostRecord(
                 usage_date=None if date_index is None else _parse_usage_date(row[date_index]),
@@ -292,9 +321,28 @@ class AccessTokenLike(Protocol):
 class SupportsGetToken(Protocol):
     def get_token(self, *scopes: str) -> AccessTokenLike: ...
 
+    def close(self) -> None: ...
+
 
 TokenProvider = Callable[[], Awaitable[str]]
 Sleeper = Callable[[float], Awaitable[None]]
+Clock = Callable[[], float]
+Jitter = Callable[[], float]
+
+_JITTER_SOURCE = secrets.SystemRandom()
+
+
+class _Deadline:
+    """One monotonic budget shared by every attempt and page of a single query."""
+
+    __slots__ = ("_clock", "_expires_at")
+
+    def __init__(self, clock: Clock, budget: float) -> None:
+        self._clock = clock
+        self._expires_at = clock() + budget
+
+    def remaining(self) -> float:
+        return self._expires_at - self._clock()
 
 
 class CredentialTokenProvider:
@@ -317,6 +365,10 @@ class CredentialTokenProvider:
     async def __call__(self) -> str:
         return await to_thread.run_sync(self._token)
 
+    async def aclose(self) -> None:
+        """Releases the credential's own transport; called by whoever created it."""
+        await to_thread.run_sync(self._credential.close)
+
 
 class CostManagementClient:
     """Posts bounded queries to one fixed subscription scope."""
@@ -328,11 +380,18 @@ class CostManagementClient:
         http_client: httpx.AsyncClient,
         acquire_token: TokenProvider,
         sleep: Sleeper = asyncio.sleep,
+        clock: Clock = monotonic,
+        jitter: Jitter = _JITTER_SOURCE.random,
+        owns_client: bool = False,
     ) -> None:
         self._url = query_url(settings.azure_subscription_id)
         self._http = http_client
         self._acquire_token = acquire_token
         self._sleep = sleep
+        self._clock = clock
+        self._jitter = jitter
+        self._owns_client = owns_client
+        self._token_lock = asyncio.Lock()
 
     @property
     def url(self) -> str:
@@ -343,39 +402,76 @@ class CostManagementClient:
         return self._http.is_closed
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        """Closes only what this client owns, so a caller's pool is never double-closed."""
+        if self._owns_client:
+            await self._http.aclose()
 
     async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
         payload = await self._fetch_all_pages(build_query(filters, granularity))
         return parse_query_result(payload, grouping=requested_grouping(filters))
 
+    async def _authorization(self) -> str:
+        # Single-flight: a cold credential is asked once while other callers wait,
+        # instead of every in-flight query racing to warm the same cache.
+        async with self._token_lock:
+            return f"Bearer {await self._acquire_token()}"
+
     async def _fetch_all_pages(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
-        token = await self._acquire_token()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        deadline = _Deadline(self._clock, QUERY_DEADLINE_SECONDS)
         url = self._url
         columns: list[Mapping[str, Any]] = []
         rows: list[Sequence[Any]] = []
 
         for _ in range(MAX_PAGES):
-            page_columns, page_rows, next_link = _page_parts(await self._post(url, body, headers))
+            # Re-acquired per page: the credential caches, so this is cheap, and a
+            # long paging loop must not keep using a token that has since expired.
+            headers = {
+                "Authorization": await self._authorization(),
+                "Content-Type": "application/json",
+            }
+            page = await self._post(url, body, headers, deadline)
+            if isinstance(page, _NoContent):
+                break
+            page_columns, page_rows, next_link = _page_parts(page)
             if not columns:
                 columns = page_columns
             elif _column_names(page_columns) != _column_names(columns):
                 raise CostResponseError("Cost Management changed the result schema between pages")
             rows.extend(page_rows)
             if next_link is None:
-                return {"properties": {"columns": columns, "rows": rows, "nextLink": None}}
+                break
             url = _validated_next_link(next_link)
+        else:
+            raise CostUpstreamError("Cost Management returned more result pages than allowed")
 
-        raise CostUpstreamError("Cost Management returned more result pages than allowed")
+        return {"properties": {"columns": columns, "rows": rows, "nextLink": None}}
+
+    async def _wait(self, delay: float, deadline: _Deadline) -> None:
+        """Never sleep past the budget: a retry that could not run must fail now."""
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise CostUpstreamTimeoutError("Cost Management did not answer within the query budget")
+        await self._sleep(min(delay, remaining))
 
     async def _post(
-        self, url: str, body: Mapping[str, Any], headers: Mapping[str, str]
-    ) -> Mapping[str, Any]:
+        self,
+        url: str,
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+        deadline: _Deadline,
+    ) -> Mapping[str, Any] | _NoContent:
         for attempt in range(MAX_RETRIES + 1):
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                raise CostUpstreamTimeoutError(
+                    "Cost Management did not answer within the query budget"
+                )
             try:
                 response = await self._http.post(
-                    url, json=body, headers=dict(headers), timeout=REQUEST_TIMEOUT_SECONDS
+                    url,
+                    json=body,
+                    headers=dict(headers),
+                    timeout=min(REQUEST_TIMEOUT_SECONDS, remaining),
                 )
             except httpx.TimeoutException as error:
                 if attempt == MAX_RETRIES:
@@ -383,23 +479,27 @@ class CostManagementClient:
                         "Cost Management did not respond in time"
                     ) from error
                 logger.warning("Cost Management request timed out; retrying")
-                await self._sleep(_backoff(attempt))
+                await self._wait(_backoff(attempt, self._jitter()), deadline)
                 continue
             except httpx.HTTPError as error:
                 raise CostUpstreamError("Cost Management could not be reached") from error
 
             status = response.status_code
             if status in (401, 403):
+                logger.warning("Cost Management returned status %s", status)
                 raise CostAccessDeniedError("Cost Management rejected the API identity")
             if status == 204:
-                return {}
+                return NO_CONTENT
             if status in RETRYABLE_STATUS_CODES:
                 if attempt == MAX_RETRIES:
+                    logger.warning("Cost Management returned status %s", status)
                     raise _retry_budget_error(status)
                 logger.warning("Cost Management returned status %s; retrying", status)
-                await self._sleep(_retry_delay(response, attempt))
+                await self._wait(_retry_delay(response, attempt, self._jitter()), deadline)
                 continue
             if status >= 400:
+                # Only the status is logged: an ARM error body can quote tenant detail.
+                logger.warning("Cost Management returned status %s", status)
                 raise CostUpstreamError(f"Cost Management returned status {status}")
             return _decoded(response)
         raise CostUpstreamError("Cost Management is unavailable")  # pragma: no cover
@@ -428,7 +528,7 @@ def _validated_next_link(next_link: str) -> str:
     return next_link
 
 
-def _retry_delay(response: httpx.Response, attempt: int) -> float:
+def _retry_delay(response: httpx.Response, attempt: int, jitter: float) -> float:
     for header in RETRY_AFTER_HEADERS:
         raw = response.headers.get(header)
         if raw is None:
@@ -439,8 +539,10 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
             continue  # an HTTP-date form is ignored in favour of the local backoff
         if seconds >= 0:
             return min(seconds, MAX_RETRY_DELAY_SECONDS)
-    return _backoff(attempt)
+    return _backoff(attempt, jitter)
 
 
-def _backoff(attempt: int) -> float:
-    return min(BASE_RETRY_DELAY_SECONDS * float(2**attempt), MAX_RETRY_DELAY_SECONDS)
+def _backoff(attempt: int, jitter: float) -> float:
+    """Exponential, plus jitter so retries from many instances do not resynchronize."""
+    delay = BASE_RETRY_DELAY_SECONDS * float(2**attempt) * (1.0 + RETRY_JITTER_FRACTION * jitter)
+    return min(delay, MAX_RETRY_DELAY_SECONDS)

@@ -4,6 +4,7 @@ Every endpoint issues the same Daily grouped query: one shape yields the totals,
 the per-day series, the per-group ranking, and the latest day that carries data.
 """
 
+import asyncio
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, date, datetime
@@ -65,6 +66,23 @@ def _latest_date(dataset: CostDataset) -> date | None:
     return max(dates) if dates else None
 
 
+def _is_comparable(current: CostDataset, previous: CostDataset) -> bool:
+    """Two periods only subtract when they are priced in the same currency."""
+    if current.currency is None or previous.currency is None:
+        return True
+    return current.currency == previous.currency
+
+
+def _change(total: float, previous_total: float) -> CostChange:
+    return CostChange(
+        amount=_money(total - previous_total),
+        # A zero or credit-dominated baseline would invert the sign of any share.
+        percentage=(
+            _money((total - previous_total) / previous_total * 100) if previous_total > 0 else None
+        ),
+    )
+
+
 class CostService:
     """Deterministic aggregation over an injected query runner."""
 
@@ -84,11 +102,15 @@ class CostService:
         }
 
     async def summary(self, filters: CostFilter) -> CostSummary:
-        current = await self.client.run_query(filters, DAILY_GRANULARITY)
-        previous = await self.client.run_query(filters.preceding_period(), DAILY_GRANULARITY)
+        # The two periods are independent queries, so they run side by side.
+        current, previous = await asyncio.gather(
+            self.client.run_query(filters, DAILY_GRANULARITY),
+            self.client.run_query(filters.preceding_period(), DAILY_GRANULARITY),
+        )
 
         total = _total(current)
-        previous_total = _total(previous)
+        comparable = _is_comparable(current, previous)
+        previous_total = _total(previous) if comparable else None
         drivers = _by_dimension(current)
         # Same ordering rule as the breakdown: largest first, ties settled by name.
         top_driver = min(drivers.items(), key=lambda item: (-item[1], item[0])) if drivers else None
@@ -96,15 +118,8 @@ class CostService:
         return CostSummary(
             **self._context(current, filters),
             total=_money(total),
-            previous_total=_money(previous_total),
-            change=CostChange(
-                amount=_money(total - previous_total),
-                percentage=(
-                    _money((total - previous_total) / previous_total * 100)
-                    if previous_total
-                    else None
-                ),
-            ),
+            previous_total=None if previous_total is None else _money(previous_total),
+            change=None if previous_total is None else _change(total, previous_total),
             # The Forecast API is a separate operation and is not part of this task,
             # so no projection is invented here.
             forecast=None,
@@ -132,22 +147,24 @@ class CostService:
             raise ValueError("limit must be at least 1")
 
         dataset = await self.client.run_query(filters, DAILY_GRANULARITY)
-        total = _total(dataset)
+        total = _money(_total(dataset))
         # Descending by amount, then by name so equal amounts keep a stable order.
         ranked = sorted(_by_dimension(dataset).items(), key=lambda item: (-item[1], item[0]))
         top = ranked[:limit]
+        items = [
+            BreakdownItem(
+                name=name,
+                amount=_money(amount),
+                percentage=_money(amount / total * 100) if total else 0.0,
+            )
+            for name, amount in top
+        ]
 
         return CostBreakdown(
             **self._context(dataset, filters),
             grouping=filters.grouping,
-            total=_money(total),
-            items=[
-                BreakdownItem(
-                    name=name,
-                    amount=_money(amount),
-                    percentage=_money(amount / total * 100) if total else 0.0,
-                )
-                for name, amount in top
-            ],
-            other_amount=_money(total - sum(amount for _, amount in top)),
+            total=total,
+            items=items,
+            # Taken from the rounded figures so the published parts add up to the total.
+            other_amount=_money(total - sum(item.amount for item in items)),
         )

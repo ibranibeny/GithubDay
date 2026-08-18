@@ -1,7 +1,9 @@
 """Query construction, filter validation, and transport behaviour of the cost client."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import date
+from typing import Any
 
 import httpx
 import pytest
@@ -11,7 +13,10 @@ from pydantic import ValidationError
 from constants import TEST_SUBSCRIPTION_ID
 from cost_copilot.clients.cost_management import (
     API_VERSION,
+    BASE_RETRY_DELAY_SECONDS,
     MAX_PAGES,
+    QUERY_DEADLINE_SECONDS,
+    RETRY_JITTER_FRACTION,
     CostAccessDeniedError,
     CostManagementClient,
     CostResponseError,
@@ -44,6 +49,39 @@ def a_filter(**overrides: object) -> CostFilter:
     return CostFilter.model_validate(values)
 
 
+async def a_token() -> str:
+    return ACCESS_TOKEN
+
+
+async def no_sleep(seconds: float) -> None:
+    return None
+
+
+def a_client(http_client: httpx.AsyncClient, **overrides: Any) -> CostManagementClient:
+    """A client wired to stubs; every timing input is injectable so tests stay offline."""
+    arguments: dict[str, Any] = {
+        "settings": get_settings(),
+        "http_client": http_client,
+        "acquire_token": a_token,
+        "sleep": no_sleep,
+        "jitter": lambda: 0.0,
+    }
+    arguments.update(overrides)
+    return CostManagementClient(**arguments)
+
+
+class SteppingClock:
+    """Advances a fixed amount per read so a wall-clock budget expires deterministically."""
+
+    def __init__(self, step: float) -> None:
+        self._step = step
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        self.now += self._step
+        return self.now
+
+
 @pytest.fixture
 async def recorded_delays() -> list[float]:
     return []
@@ -54,17 +92,9 @@ async def client(recorded_delays: list[float]) -> AsyncIterator[CostManagementCl
     async def sleep(seconds: float) -> None:
         recorded_delays.append(seconds)
 
-    async def acquire_token() -> str:
-        return ACCESS_TOKEN
-
     http_client = httpx.AsyncClient()
     try:
-        yield CostManagementClient(
-            settings=get_settings(),
-            http_client=http_client,
-            acquire_token=acquire_token,
-            sleep=sleep,
-        )
+        yield a_client(http_client, sleep=sleep)
     finally:
         await http_client.aclose()
 
@@ -131,6 +161,14 @@ def test_blank_tag_key_is_rejected() -> None:
 def test_tag_key_with_control_characters_is_rejected() -> None:
     with pytest.raises(ValidationError, match="printable"):
         a_filter(grouping=CostGrouping.TAG, tag_key="cost\ncenter")
+
+
+@pytest.mark.parametrize(
+    "grouping", [CostGrouping.SERVICE, CostGrouping.RESOURCE_GROUP, CostGrouping.RESOURCE]
+)
+def test_a_tag_key_without_tag_grouping_is_rejected(grouping: CostGrouping) -> None:
+    with pytest.raises(ValidationError, match="tag grouping"):
+        a_filter(grouping=grouping, tag_key="cost-center")
 
 
 def test_azure_dimension_prefers_the_tag_key_for_tag_grouping() -> None:
@@ -233,6 +271,21 @@ async def test_the_requested_dimension_wins_over_another_string_column(
 
 
 @respx.mock
+async def test_a_tag_grouped_response_without_a_tag_value_column_is_unassigned(
+    client: CostManagementClient,
+) -> None:
+    respx.post(QUERY_URL).mock(
+        return_value=httpx.Response(200, json=cost_fixture("tagGroupedWithoutTagValue"))
+    )
+
+    dataset = await client.run_query(
+        a_filter(grouping=CostGrouping.TAG, tag_key="cost-center"), "Daily"
+    )
+
+    assert [record.dimension for record in dataset.records] == ["Unassigned"]
+
+
+@respx.mock
 async def test_no_content_yields_an_empty_dataset(client: CostManagementClient) -> None:
     respx.post(QUERY_URL).mock(return_value=httpx.Response(204))
 
@@ -240,6 +293,21 @@ async def test_no_content_yields_an_empty_dataset(client: CostManagementClient) 
 
     assert dataset.records == ()
     assert dataset.currency is None
+
+
+@respx.mock
+async def test_a_success_body_without_properties_is_rejected_instead_of_reading_as_zero(
+    client: CostManagementClient,
+) -> None:
+    """A 200 that lost its payload must fail closed; only a real 204 means "no cost"."""
+    respx.post(QUERY_URL).mock(
+        return_value=httpx.Response(200, json={"id": "/subscriptions/contoso-secret/query"})
+    )
+
+    with pytest.raises(CostResponseError, match="properties") as raised:
+        await client.run_query(a_filter(), "Daily")
+
+    assert "contoso-secret" not in str(raised.value)
 
 
 @respx.mock
@@ -451,6 +519,92 @@ async def test_endless_paging_is_bounded(client: CostManagementClient) -> None:
     assert respx.calls.call_count == MAX_PAGES
 
 
+# --- the cumulative query deadline -----------------------------------------
+
+
+@respx.mock
+async def test_paging_stops_once_the_query_budget_is_spent() -> None:
+    """The per-attempt timeout must not multiply across pages."""
+    page = cost_fixture("pageOne")
+    page["properties"]["nextLink"] = QUERY_URL
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=page))
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, clock=SteppingClock(QUERY_DEADLINE_SECONDS / 4))
+
+        with pytest.raises(CostUpstreamTimeoutError):
+            await client.run_query(a_filter(), "Daily")
+
+    assert 0 < respx.calls.call_count < MAX_PAGES
+
+
+@respx.mock
+async def test_retrying_stops_once_the_query_budget_is_spent() -> None:
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(429))
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, clock=SteppingClock(QUERY_DEADLINE_SECONDS / 2))
+
+        with pytest.raises(CostUpstreamTimeoutError):
+            await client.run_query(a_filter(), "Daily")
+
+    assert respx.calls.call_count == 1
+
+
+@respx.mock
+async def test_a_request_timeout_never_outlives_the_remaining_budget() -> None:
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, clock=SteppingClock(QUERY_DEADLINE_SECONDS - 1.0))
+
+        await client.run_query(a_filter(), "Daily")
+
+    assert respx.calls.last.request.extensions["timeout"]["read"] == pytest.approx(1.0)
+
+
+@respx.mock
+async def test_local_backoff_carries_jitter(recorded_delays: list[float]) -> None:
+    """Jitter decorrelates retries across instances; the cap still applies."""
+
+    async def sleep(seconds: float) -> None:
+        recorded_delays.append(seconds)
+
+    respx.post(QUERY_URL).mock(
+        side_effect=[
+            httpx.Response(503),
+            httpx.Response(200, json=cost_fixture("groupedDaily")),
+        ]
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, sleep=sleep, jitter=lambda: 1.0)
+
+        await client.run_query(a_filter(), "Daily")
+
+    assert recorded_delays == [BASE_RETRY_DELAY_SECONDS * (1.0 + RETRY_JITTER_FRACTION)]
+
+
+# --- lifecycle -------------------------------------------------------------
+
+
+async def test_aclose_leaves_a_pool_the_caller_owns_open() -> None:
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client)
+
+        await client.aclose()
+
+        assert not client.is_closed
+
+
+async def test_aclose_closes_a_pool_the_client_owns() -> None:
+    client = a_client(httpx.AsyncClient(), owns_client=True)
+
+    await client.aclose()
+
+    assert client.is_closed
+
+
 # --- token acquisition -----------------------------------------------------
 
 
@@ -463,10 +617,14 @@ class _StubAccessToken:
 class _StubCredential:
     def __init__(self) -> None:
         self.scopes: list[tuple[str, ...]] = []
+        self.closed = False
 
     def get_token(self, *scopes: str) -> _StubAccessToken:
         self.scopes.append(scopes)
         return _StubAccessToken(ACCESS_TOKEN)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 async def test_token_provider_requests_the_management_scope() -> None:
@@ -477,29 +635,58 @@ async def test_token_provider_requests_the_management_scope() -> None:
     assert credential.scopes == [("https://management.azure.com/.default",)]
 
 
-async def test_a_paged_query_acquires_exactly_one_token() -> None:
-    calls: list[int] = []
+async def test_token_provider_closes_the_credential_it_was_given() -> None:
+    credential = _StubCredential()
+    provider = CredentialTokenProvider(credential)
 
-    async def counting_token() -> str:
-        calls.append(1)
-        return ACCESS_TOKEN
+    await provider.aclose()
 
-    async def sleep(seconds: float) -> None:  # pragma: no cover - no retry in this test
-        return None
+    assert credential.closed
+
+
+@respx.mock
+async def test_every_page_is_authorized_with_a_freshly_acquired_token() -> None:
+    """A long paging loop can outlive a token, and the credential caches, so re-ask."""
+    tokens: list[str] = []
+
+    async def rotating_token() -> str:
+        tokens.append(f"token-{len(tokens)}")
+        return tokens[-1]
 
     page_one = cost_fixture("pageOne")
-    async with httpx.AsyncClient() as http_client:
-        client = CostManagementClient(
-            settings=get_settings(),
-            http_client=http_client,
-            acquire_token=counting_token,
-            sleep=sleep,
-        )
-        with respx.mock:
-            respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=page_one))
-            respx.post(page_one["properties"]["nextLink"]).mock(
-                return_value=httpx.Response(200, json=cost_fixture("pageTwo"))
-            )
-            await client.run_query(a_filter(), "Daily")
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=page_one))
+    second = respx.post(page_one["properties"]["nextLink"]).mock(
+        return_value=httpx.Response(200, json=cost_fixture("pageTwo"))
+    )
 
-    assert calls == [1]
+    async with httpx.AsyncClient() as http_client:
+        await a_client(http_client, acquire_token=rotating_token).run_query(a_filter(), "Daily")
+
+    assert tokens == ["token-0", "token-1"]
+    assert second.calls.last.request.headers["authorization"] == "Bearer token-1"
+
+
+@respx.mock
+async def test_concurrent_queries_acquire_a_token_one_at_a_time() -> None:
+    """Single-flight: a cold credential must not be hit by every in-flight query."""
+    in_flight = 0
+    peak = 0
+
+    async def counting_token() -> str:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return ACCESS_TOKEN
+
+    respx.post(QUERY_URL).mock(return_value=httpx.Response(200, json=cost_fixture("groupedDaily")))
+
+    async with httpx.AsyncClient() as http_client:
+        client = a_client(http_client, acquire_token=counting_token)
+
+        await asyncio.gather(
+            client.run_query(a_filter(), "Daily"), client.run_query(a_filter(), "Daily")
+        )
+
+    assert peak == 1

@@ -1,5 +1,6 @@
 """Aggregation rules for the cost service, exercised against an injected client."""
 
+import asyncio
 from datetime import UTC, date, datetime
 
 import pytest
@@ -22,10 +23,19 @@ class StubCostClient:
     def __init__(self, *datasets: CostDataset) -> None:
         self._datasets = list(datasets)
         self.calls: list[tuple[CostFilter, str]] = []
+        self.in_flight = 0
+        self.peak_in_flight = 0
 
     async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
+        index = len(self.calls)
         self.calls.append((filters, granularity))
-        return self._datasets[min(len(self.calls) - 1, len(self._datasets) - 1)]
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0)  # a yield point, so concurrent callers can overlap
+            return self._datasets[min(index, len(self._datasets) - 1)]
+        finally:
+            self.in_flight -= 1
 
 
 def a_filter(**overrides: object) -> CostFilter:
@@ -60,10 +70,58 @@ async def test_summary_totals_compare_against_the_preceding_period() -> None:
 
     assert summary.total == 45.0
     assert summary.previous_total == 30.0
+    assert summary.change is not None
     assert summary.change.amount == 15.0
     assert summary.change.percentage == 50.0
     assert client.calls[0][1] == "Daily"
     assert client.calls[1][0].end == date(2026, 7, 31)
+
+
+async def test_summary_runs_both_period_queries_concurrently() -> None:
+    service, client = a_service(parse_query_result(cost_fixture("groupedDaily")), a_dataset())
+
+    await service.summary(a_filter())
+
+    assert client.peak_in_flight == 2
+
+
+async def test_a_comparison_across_currencies_is_withheld_rather_than_invented() -> None:
+    """A EUR period minus a USD period is not a number anyone should act on."""
+    current = a_dataset((date(2026, 8, 1), "Fabrikam Widget Service", 45.0), currency="EUR")
+    previous = a_dataset((date(2026, 7, 20), "Fabrikam Widget Service", 30.0), currency="USD")
+    service, _ = a_service(current, previous)
+
+    summary = await service.summary(a_filter())
+
+    assert summary.currency == "EUR"
+    assert summary.total == 45.0
+    assert summary.previous_total is None
+    assert summary.change is None
+
+
+async def test_a_comparison_is_kept_when_only_one_period_reports_a_currency() -> None:
+    current = a_dataset((date(2026, 8, 1), "Fabrikam Widget Service", 45.0), currency="USD")
+    previous = CostDataset(currency=None, records=())
+    service, _ = a_service(current, previous)
+
+    summary = await service.summary(a_filter())
+
+    assert summary.previous_total == 0.0
+    assert summary.change is not None
+    assert summary.change.amount == 45.0
+
+
+async def test_a_negative_previous_total_yields_no_percentage() -> None:
+    """A credit-dominated period would flip the sign of any percentage change."""
+    current = a_dataset((date(2026, 8, 1), "Fabrikam Widget Service", 50.0))
+    previous = a_dataset((date(2026, 7, 20), "Fabrikam Widget Service", -20.0))
+    service, _ = a_service(current, previous)
+
+    summary = await service.summary(a_filter())
+
+    assert summary.change is not None
+    assert summary.change.amount == 70.0
+    assert summary.change.percentage is None
 
 
 async def test_summary_reports_the_largest_driver_and_no_forecast() -> None:
@@ -85,6 +143,7 @@ async def test_summary_of_an_empty_period_is_zero_valued() -> None:
 
     assert summary.total == 0.0
     assert summary.previous_total == 0.0
+    assert summary.change is not None
     assert summary.change.amount == 0.0
     assert summary.change.percentage is None
     assert summary.top_driver is None
@@ -176,6 +235,24 @@ async def test_breakdown_folds_the_tail_into_other() -> None:
 
     assert [item.name for item in breakdown.items] == ["a", "b", "c"]
     assert breakdown.other_amount == 10.0
+
+
+async def test_breakdown_parts_add_up_to_the_reported_total() -> None:
+    """Rounding must not leave the published items and remainder off the total."""
+    service, _ = a_service(
+        a_dataset(
+            (None, "a", 10.005),
+            (None, "b", 10.005),
+            (None, "c", 0.333),
+            (None, "d", 0.333),
+        )
+    )
+
+    breakdown = await service.breakdown(a_filter(), limit=2)
+
+    assert sum(item.amount for item in breakdown.items) + breakdown.other_amount == pytest.approx(
+        breakdown.total
+    )
 
 
 async def test_breakdown_ties_are_broken_by_name_for_determinism() -> None:

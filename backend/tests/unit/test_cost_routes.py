@@ -1,8 +1,10 @@
 """Route wiring for the cost APIs, with auth and the cost service stubbed out."""
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 import respx
 from fastapi import FastAPI
@@ -11,6 +13,7 @@ from fastapi.testclient import TestClient
 from constants import TEST_SUBSCRIPTION_ID
 from cost_copilot.auth import COST_READER_ROLE, verify_token
 from cost_copilot.clients.cost_management import (
+    API_VERSION,
     CostAccessDeniedError,
     CostDataset,
     CostManagementClient,
@@ -24,11 +27,12 @@ from cost_copilot.clients.cost_management import (
 from cost_copilot.config import get_settings
 from cost_copilot.main import create_app
 from cost_copilot.models.cost import CostFilter
+from cost_copilot.routers import costs
 from cost_copilot.routers.costs import (
     UPSTREAM_THROTTLED_DETAIL,
     UPSTREAM_TIMEOUT_DETAIL,
     UPSTREAM_UNAVAILABLE_DETAIL,
-    build_cost_service,
+    build_cost_client,
     get_cost_service,
 )
 from cost_copilot.services.cost_service import CostService
@@ -37,19 +41,32 @@ from fixture_data import cost_fixture
 CLAIMS = {"oid": "00000000-0000-0000-0000-000000000002", "roles": [COST_READER_ROLE]}
 PARAMS = {"start": "2026-08-01", "end": "2026-08-17"}
 NOW = datetime(2026, 8, 18, 9, 30, tzinfo=UTC)
+QUERY_URL = (
+    f"https://management.azure.com/subscriptions/{TEST_SUBSCRIPTION_ID}"
+    f"/providers/Microsoft.CostManagement/query?api-version={API_VERSION}"
+)
 
 
 class StubCostClient:
-    def __init__(self, dataset: CostDataset | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        dataset: CostDataset | None = None,
+        error: Exception | None = None,
+        previous: CostDataset | None = None,
+    ) -> None:
         self._dataset = dataset if dataset is not None else CostDataset(None, ())
+        self._previous = previous
         self._error = error
         self.calls: list[tuple[CostFilter, str]] = []
 
     async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
+        first = not self.calls
         self.calls.append((filters, granularity))
         if self._error is not None:
             raise self._error
-        return self._dataset
+        if first or self._previous is None:
+            return self._dataset
+        return self._previous
 
 
 def build_client(
@@ -110,6 +127,20 @@ def test_summary_returns_the_typed_payload() -> None:
     assert body["forecast"] is None
 
 
+def test_a_cross_currency_summary_publishes_nulls_instead_of_a_bogus_delta() -> None:
+    current = parse_query_result(cost_fixture("groupedDaily"))
+    previous = parse_query_result(cost_fixture("preTaxCostOffer"))
+    client, _ = build_client(client=StubCostClient(current, previous=previous))
+
+    response = client.get("/api/costs/summary", params=PARAMS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 45.0
+    assert body["previousTotal"] is None
+    assert body["change"] is None
+
+
 def test_trend_returns_a_daily_series() -> None:
     client, cost_client = build_client()
 
@@ -154,6 +185,7 @@ def test_tag_grouping_passes_the_tag_key_through() -> None:
         {"start": "2026-08-17", "end": "2026-08-01"},
         {"start": "2025-01-01", "end": "2026-08-01"},
         {"start": "2026-08-01", "end": "2026-08-17", "grouping": "Tag"},
+        {"start": "2026-08-01", "end": "2026-08-17", "tagKey": "cost-center"},
     ],
 )
 def test_an_invalid_filter_is_refused_before_any_upstream_call(params: dict[str, str]) -> None:
@@ -209,9 +241,42 @@ def test_upstream_failures_map_to_safe_statuses(
     assert "contoso-internal" not in response.text
 
 
-async def test_the_default_service_targets_only_the_configured_subscription() -> None:
-    client = build_cost_service(get_settings()).client
-    assert isinstance(client, CostManagementClient)
+def test_an_upstream_body_without_properties_is_reported_as_unavailable() -> None:
+    """End to end: a malformed 200 must never surface to a caller as a zero bill."""
+    app = create_app()
+    app.dependency_overrides[verify_token] = lambda: CLAIMS
+
+    async def token() -> str:
+        return "stub-token"  # noqa: S105  # not a credential, only a stub value
+
+    http_client = httpx.AsyncClient()
+    try:
+        with respx.mock:
+            respx.post(QUERY_URL).mock(
+                return_value=httpx.Response(
+                    200, json={"id": "/subscriptions/contoso-internal/query"}
+                )
+            )
+            app.state.cost_service = CostService(
+                CostManagementClient(
+                    settings=get_settings(), http_client=http_client, acquire_token=token
+                ),
+                now=lambda: NOW,
+            )
+            response = TestClient(app).get("/api/costs/summary", params=PARAMS)
+    finally:
+        asyncio.run(http_client.aclose())
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": UPSTREAM_UNAVAILABLE_DETAIL}
+    assert "contoso-internal" not in response.text
+
+
+async def test_the_default_client_targets_only_the_configured_subscription() -> None:
+    async def token() -> str:
+        return "stub-token"  # noqa: S105  # not a credential, only a stub value
+
+    client = build_cost_client(get_settings(), acquire_token=token)
     try:
         assert client.url == (
             f"https://management.azure.com/subscriptions/{TEST_SUBSCRIPTION_ID}"
@@ -219,9 +284,27 @@ async def test_the_default_service_targets_only_the_configured_subscription() ->
         )
     finally:
         await client.aclose()
+    assert client.is_closed
 
 
-def test_the_production_cost_client_is_closed_on_shutdown() -> None:
+class _RecordingCredential:
+    """Stands in for DefaultAzureCredential so shutdown never touches an identity endpoint."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def get_token(self, *scopes: str) -> object:  # pragma: no cover - no request is issued
+        raise AssertionError("the shutdown test must not acquire a token")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_the_production_cost_client_and_credential_are_closed_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = _RecordingCredential()
+    monkeypatch.setattr(costs, "DefaultAzureCredential", lambda: credential)
     app = create_app()
 
     with TestClient(app):
@@ -232,6 +315,7 @@ def test_the_production_cost_client_is_closed_on_shutdown() -> None:
         assert not cost_client.is_closed
 
     assert cost_client.is_closed
+    assert credential.closed
 
 
 def test_a_request_before_startup_is_refused_instead_of_building_a_client() -> None:

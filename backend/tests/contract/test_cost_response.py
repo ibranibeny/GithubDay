@@ -82,6 +82,16 @@ def test_a_tag_grouped_result_binds_the_tag_value_column() -> None:
     assert [record.dimension for record in dataset.records] == ["fin-ops", "platform"]
 
 
+def test_a_tag_grouped_result_without_a_tag_value_column_is_unassigned() -> None:
+    """The TagKey column repeats the requested key, so it is never a group label."""
+    dataset = parse_query_result(
+        cost_fixture("tagGroupedWithoutTagValue"),
+        grouping=RequestedGrouping("cost-center", is_tag=True),
+    )
+
+    assert [record.dimension for record in dataset.records] == ["Unassigned"]
+
+
 def test_a_dimension_grouped_result_binds_the_requested_dimension() -> None:
     dataset = parse_query_result(
         cost_fixture("dimensionGroupedWithExtraString"),
@@ -118,8 +128,10 @@ def test_an_empty_row_set_produces_an_empty_dataset() -> None:
     assert dataset.currency is None
 
 
-def test_a_no_content_response_produces_an_empty_dataset() -> None:
-    assert parse_query_result({}).records == ()
+def test_a_body_without_properties_is_rejected() -> None:
+    """Only a 204 means "no cost"; a 200 that lost its payload must not read as zero."""
+    with pytest.raises(CostResponseError, match="properties"):
+        parse_query_result({})
 
 
 def test_a_result_without_a_currency_column_reports_no_currency() -> None:
@@ -128,6 +140,14 @@ def test_a_result_without_a_currency_column_reports_no_currency() -> None:
     assert dataset.currency is None
     assert dataset.records[0].amount == 3.25
     assert dataset.records[0].dimension == "Fabrikam Widget Service"
+
+
+def test_currency_codes_are_normalized_and_unusable_values_are_ignored() -> None:
+    """Padding, casing, a blank cell, and a null must not read as separate currencies."""
+    dataset = parse_query_result(cost_fixture("paddedCurrency"))
+
+    assert dataset.currency == "USD"
+    assert len(dataset.records) == 4
 
 
 def test_mixed_currencies_are_rejected() -> None:

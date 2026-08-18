@@ -53,6 +53,8 @@ class CostFilter(BaseModel):
             raise ValueError("tag_key must contain printable characters only")
         if self.grouping is CostGrouping.TAG and not (self.tag_key or "").strip():
             raise ValueError("tag_key is required for tag grouping")
+        if self.grouping is not CostGrouping.TAG and self.tag_key is not None:
+            raise ValueError("tag_key is only accepted with tag grouping")
         return self
 
     @property
@@ -99,8 +101,9 @@ class TopDriver(CostApiModel):
 
 class CostSummary(CostContext):
     total: float
-    previous_total: float
-    change: CostChange
+    # Both are withheld when the two periods are priced in different currencies.
+    previous_total: float | None = None
+    change: CostChange | None = None
     forecast: float | None = None
     top_driver: TopDriver | None = None
 

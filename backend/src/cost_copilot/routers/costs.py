@@ -19,6 +19,7 @@ from cost_copilot.clients.cost_management import (
     CostThrottledError,
     CostUpstreamTimeoutError,
     CredentialTokenProvider,
+    TokenProvider,
 )
 from cost_copilot.config import Settings, get_settings
 from cost_copilot.models.cost import (
@@ -42,28 +43,27 @@ UPSTREAM_TIMEOUT_DETAIL = "Cost data request timed out"
 COST_SERVICE_STATE_ATTRIBUTE = "cost_service"
 
 
-def build_cost_client(settings: Settings) -> CostManagementClient:
-    """Compose the production client. The scope is read from settings only."""
+def build_cost_client(settings: Settings, *, acquire_token: TokenProvider) -> CostManagementClient:
+    """Compose the production client; it owns the pool created here and closes it."""
     return CostManagementClient(
         settings=settings,
         http_client=httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS),
-        acquire_token=CredentialTokenProvider(DefaultAzureCredential()),
+        acquire_token=acquire_token,
+        owns_client=True,
     )
-
-
-def build_cost_service(settings: Settings) -> CostService:
-    return CostService(build_cost_client(settings))
 
 
 @asynccontextmanager
 async def cost_service_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """One connection pool per application lifetime, closed on shutdown."""
-    client = build_cost_client(get_settings())
+    """One connection pool and one credential per application lifetime."""
+    tokens = CredentialTokenProvider(DefaultAzureCredential())
+    client = build_cost_client(get_settings(), acquire_token=tokens)
     setattr(app.state, COST_SERVICE_STATE_ATTRIBUTE, CostService(client))
     try:
         yield
     finally:
         await client.aclose()
+        await tokens.aclose()
 
 
 def get_cost_service(request: Request) -> CostService:

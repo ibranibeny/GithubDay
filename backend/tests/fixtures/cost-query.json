@@ -83,6 +83,18 @@
       "nextLink": null
     }
   },
+  "tagGroupedWithoutTagValue": {
+    "properties": {
+      "columns": [
+        { "name": "TagKey", "type": "String" },
+        { "name": "Cost", "type": "Number" },
+        { "name": "UsageDate", "type": "Number" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [["cost-center", 12.5, 20260801, "USD"]],
+      "nextLink": null
+    }
+  },
   "dimensionGroupedWithExtraString": {
     "properties": {
       "columns": [
@@ -131,6 +143,22 @@
       "rows": [
         [10.0, "Fabrikam Widget Service", "USD"],
         [10.0, "Fabrikam Ledger Service", "EUR"]
+      ],
+      "nextLink": null
+    }
+  },
+  "paddedCurrency": {
+    "properties": {
+      "columns": [
+        { "name": "Cost", "type": "Number" },
+        { "name": "ServiceName", "type": "String" },
+        { "name": "Currency", "type": "String" }
+      ],
+      "rows": [
+        [10.0, "Fabrikam Widget Service", " usd "],
+        [5.0, "Fabrikam Ledger Service", "USD"],
+        [1.0, "Fabrikam Archive Service", ""],
+        [2.0, "Fabrikam Cache Service", null]
       ],
       "nextLink": null
     }
