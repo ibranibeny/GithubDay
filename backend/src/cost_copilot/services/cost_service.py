@@ -5,6 +5,7 @@ the per-day series, the per-group ranking, and the latest day that carries data.
 """
 
 import asyncio
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, date, datetime
@@ -32,6 +33,57 @@ class CostQueryRunner(Protocol):
     """The slice of the Cost Management client this service depends on."""
 
     async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset: ...
+
+
+class CachingCostQueryRunner:
+    """A short in-memory TTL cache in front of a CostQueryRunner.
+
+    The Cost Management Query API is aggressively rate limited (HTTP 429), and the
+    dashboard fans several endpoints out onto the *same* Daily grouped query.
+    Caching by query for a short window, with a single in-flight call per key,
+    collapses those duplicates and lets a refresh reuse the last result.
+    """
+
+    def __init__(self, inner: CostQueryRunner, *, ttl_seconds: float = 180.0) -> None:
+        self._inner = inner
+        self._ttl = ttl_seconds
+        self._entries: dict[str, tuple[float, CostDataset]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
+        key = self._key(filters, granularity)
+        cached = self._fresh(key)
+        if cached is not None:
+            return cached
+        # One upstream call per key: sibling endpoints that resolve to the same
+        # query wait on the first rather than each spending a rate-limit budget.
+        async with self._locks.setdefault(key, asyncio.Lock()):
+            cached = self._fresh(key)
+            if cached is not None:
+                return cached
+            result = await self._inner.run_query(filters, granularity)
+            self._entries[key] = (time.monotonic(), result)
+            return result
+
+    def _fresh(self, key: str) -> CostDataset | None:
+        entry = self._entries.get(key)
+        if entry is not None and time.monotonic() - entry[0] < self._ttl:
+            return entry[1]
+        return None
+
+    @staticmethod
+    def _key(filters: CostFilter, granularity: str) -> str:
+        return "|".join(
+            str(part)
+            for part in (
+                filters.start,
+                filters.end,
+                filters.metric,
+                filters.grouping,
+                filters.tag_key,
+                granularity,
+            )
+        )
 
 
 def _utc_now() -> datetime:
