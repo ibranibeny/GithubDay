@@ -60,6 +60,10 @@ FRONTEND_APP_ID=""
 FRONTEND_APP_FQDN=""
 ACTION_GROUP_ID=""
 APPROVED_PRIVATE_LINK_CONNECTIONS=0
+# A supported Front Door Private Link region, resolved by
+# resolve_private_link_location(); may differ from ACA_LOCATION. Honors an
+# inherited value so an operator can pin it.
+AFD_PRIVATE_LINK_LOCATION="${AFD_PRIVATE_LINK_LOCATION:-}"
 
 declare -a ENVIRONMENT_TAGS=()
 
@@ -114,6 +118,7 @@ load_environment_config() {
   )
 
   assert_route_patterns_are_ordered
+  resolve_private_link_location
 }
 
 # Front Door picks the most specific path pattern. That only gives a
@@ -295,6 +300,34 @@ detect_private_link_flag_style() {
   log "private-link origin flag style: ${AFD_PRIVATE_LINK_FLAG_STYLE}"
 }
 
+# Azure Front Door Private Link endpoints are only offered in a subset of
+# Availability-Zone regions:
+#   https://learn.microsoft.com/azure/frontdoor/private-link#region-availability
+# The endpoint can sit in a different region than the origin and still reach it
+# privately over the Microsoft backbone, so when ACA_LOCATION is unsupported the
+# endpoint is placed in the nearest supported region. Override the choice with
+# AFD_PRIVATE_LINK_LOCATION or the fallback with AFD_PRIVATE_LINK_FALLBACK_LOCATION.
+AFD_PRIVATE_LINK_SUPPORTED_REGIONS="brazilsouth canadacentral centralus eastus eastus2 southcentralus westus2 westus3 usgovarizona usgovtexas usgovvirginia francecentral germanywestcentral northeurope norwayeast uksouth westeurope swedencentral southafricanorth uaenorth australiaeast centralindia japaneast koreacentral eastasia southeastasia"
+
+resolve_private_link_location() {
+  local region fallback="${AFD_PRIVATE_LINK_FALLBACK_LOCATION:-southeastasia}"
+
+  if [ -n "$AFD_PRIVATE_LINK_LOCATION" ]; then
+    ok "Front Door Private Link location pinned to ${AFD_PRIVATE_LINK_LOCATION}"
+    return 0
+  fi
+
+  for region in $AFD_PRIVATE_LINK_SUPPORTED_REGIONS; do
+    if [ "$region" = "$ACA_LOCATION" ]; then
+      AFD_PRIVATE_LINK_LOCATION="$ACA_LOCATION"
+      return 0
+    fi
+  done
+
+  AFD_PRIVATE_LINK_LOCATION="$fallback"
+  warn "Front Door Private Link is not available in ${ACA_LOCATION}; placing the private endpoint in ${AFD_PRIVATE_LINK_LOCATION} (nearest supported region). Traffic reaches the ${ACA_LOCATION} origin over the Microsoft backbone. Override with AFD_PRIVATE_LINK_LOCATION."
+}
+
 # ensure_private_origin <origin name> <origin group name> <app fqdn> <role>
 ensure_private_origin() {
   local name="${1:?ensure_private_origin requires an origin name}"
@@ -324,13 +357,13 @@ ensure_private_origin() {
     warn "this Azure CLI only offers --shared-private-link-resource; the compound argument shape is not verified against a live deployment"
     private_link_args=(
       --shared-private-link-resource
-      "{private-link:{id:${ACA_ENVIRONMENT_ID}},private-link-location:${ACA_LOCATION},group-id:managedEnvironments,request-message:'${request_message}'}"
+      "{private-link:{id:${ACA_ENVIRONMENT_ID}},private-link-location:${AFD_PRIVATE_LINK_LOCATION},group-id:managedEnvironments,request-message:'${request_message}'}"
     )
   else
     private_link_args=(
       --enable-private-link true
       --private-link-resource "$ACA_ENVIRONMENT_ID"
-      --private-link-location "$ACA_LOCATION"
+      --private-link-location "$AFD_PRIVATE_LINK_LOCATION"
       --private-link-sub-resource-type managedEnvironments
       --private-link-request-message "$request_message"
     )
