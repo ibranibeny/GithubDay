@@ -1,0 +1,135 @@
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import pytest
+from pydantic import AnyHttpUrl
+
+from constants import (
+    TEST_API_CLIENT_ID,
+    TEST_FOUNDRY_ENDPOINT,
+    TEST_SUBSCRIPTION_ID,
+    TEST_TENANT_ID,
+)
+from cost_copilot import config
+from cost_copilot.config import Settings, get_settings
+
+
+def build_settings(**overrides: Any) -> Settings:
+    """Unpacking keeps mypy from demanding fields that come from the environment.
+
+    `_env_file=None` keeps the suite hermetic: a developer's backend/.env must
+    never change what these tests observe.
+    """
+    return Settings(_env_file=None, **overrides)  # type: ignore[call-arg]
+
+
+@pytest.fixture(autouse=True)
+def _clear_settings_cache() -> Iterator[None]:
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def test_subscription_is_fixed_by_configuration() -> None:
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        azure_tenant_id=UUID(TEST_TENANT_ID),
+        azure_subscription_id=UUID(TEST_SUBSCRIPTION_ID),
+        entra_api_client_id=TEST_API_CLIENT_ID,
+        foundry_endpoint=AnyHttpUrl(TEST_FOUNDRY_ENDPOINT),
+        foundry_deployment="gpt-5.4-mini",
+    )
+
+    assert str(settings.azure_subscription_id) == TEST_SUBSCRIPTION_ID
+
+
+def test_tenant_and_subscription_are_uuid_typed() -> None:
+    settings = build_settings()
+
+    assert settings.azure_tenant_id == UUID(TEST_TENANT_ID)
+    assert settings.azure_subscription_id == UUID(TEST_SUBSCRIPTION_ID)
+    assert str(settings.azure_subscription_id) == TEST_SUBSCRIPTION_ID
+
+
+def test_non_uuid_identifiers_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", "not-a-subscription")
+
+    with pytest.raises(ValueError, match="azure_subscription_id"):
+        build_settings()
+
+
+@pytest.mark.parametrize("origins", ["*", "https://app.example,*", " * "])
+def test_wildcard_origins_are_rejected(monkeypatch: pytest.MonkeyPatch, origins: str) -> None:
+    monkeypatch.setenv("ALLOWED_ORIGINS", origins)
+
+    with pytest.raises(ValueError, match="allowed_origins"):
+        build_settings()
+
+
+def test_optional_fields_have_safe_defaults() -> None:
+    settings = build_settings()
+
+    assert settings.azure_client_id is None
+    assert settings.applicationinsights_connection_string is None
+    assert settings.foundry_deployment == "gpt-5.4-mini"
+    assert settings.allowed_origins == "http://localhost:5173"
+    assert settings.cors_origins == ["http://localhost:5173"]
+
+
+def test_missing_required_field_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ENTRA_API_CLIENT_ID", raising=False)
+
+    with pytest.raises(ValueError, match="entra_api_client_id"):
+        build_settings()
+
+
+def test_env_file_is_resolved_relative_to_the_backend_project() -> None:
+    backend_root = Path(config.__file__).resolve().parents[2]
+
+    assert config.ENV_FILE == backend_root / ".env"
+    assert config.ENV_FILE.is_absolute()
+    assert Settings.model_config["env_file"] == config.ENV_FILE
+
+
+def test_env_file_in_the_caller_working_directory_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text("FOUNDRY_DEPLOYMENT=from-caller-cwd\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert Settings().foundry_deployment == "gpt-5.4-mini"  # type: ignore[call-arg]
+
+
+def test_configured_env_file_is_read_but_the_test_factory_ignores_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("FOUNDRY_DEPLOYMENT=from-project-dotenv\n", encoding="utf-8")
+    monkeypatch.setitem(Settings.model_config, "env_file", env_file)
+
+    assert Settings().foundry_deployment == "from-project-dotenv"  # type: ignore[call-arg]
+    assert build_settings().foundry_deployment == "gpt-5.4-mini"
+
+
+def test_environment_variables_stay_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FOUNDRY_DEPLOYMENT", "gpt-from-environment")
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://a.example, https://b.example ,")
+
+    settings = build_settings()
+
+    assert settings.foundry_deployment == "gpt-from-environment"
+    assert settings.cors_origins == ["https://a.example", "https://b.example"]
+
+
+def test_the_deployment_environment_defaults_to_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert build_settings().app_environment == "local"
+
+    monkeypatch.setenv("APP_ENVIRONMENT", "prod")
+
+    assert build_settings().app_environment == "prod"
+
+
+def test_get_settings_is_cached() -> None:
+    assert get_settings() is get_settings()

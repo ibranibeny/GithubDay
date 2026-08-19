@@ -1,0 +1,85 @@
+# Automatic promotion: open (or refresh) the staging -> main pull request once
+# a staging deployment has actually proven itself.
+#
+# The trigger is `workflow_run` on "Deploy staging" rather than another `push`
+# to `staging`, because "the branch moved" and "the deployment on that branch
+# passed" are different facts and only the second one justifies proposing a
+# production release. `workflow_run` fires after the deploy workflow finishes
+# and carries its conclusion, so this workflow can insist on success.
+#
+# `types: [completed]` fires for every conclusion - success, failure, cancelled
+# and skipped alike - so the `if` below is the real gate, not the trigger.
+#
+# What this deliberately does NOT do: merge. A human still reviews and merges
+# the promotion pull request, which is where branch protection on `main` and
+# the production environment reviewers apply.
+name: Promote staging
+
+on:
+  workflow_run:
+    # Must stay identical to the `name:` of .github/workflows/deploy-staging.yml.
+    # GitHub matches on the workflow's display name, so renaming that workflow
+    # silently stops promotions.
+    workflows: ["Deploy staging"]
+    types:
+      - completed
+
+# The pull request is the only thing written. No Azure access, no OIDC token,
+# no ability to push code.
+permissions:
+  contents: read
+  pull-requests: write
+
+# Never cancel a promotion in flight: it is a single idempotent API call, and a
+# cancelled one would leave the existing pull request describing an older commit.
+concurrency:
+  group: promote-staging
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  promotion-pull-request:
+    name: promotion pull request
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Two conditions, both required. The conclusion check is what makes this a
+    # gate; the branch check stops a deploy run triggered from anywhere else
+    # from proposing a production release.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'staging'
+    steps:
+      - name: Open or update the promotion pull request
+        env:
+          # The job's own GITHUB_TOKEN, scoped by the `permissions` block above.
+          GH_TOKEN: ${{ github.token }}
+          # gh resolves the repository from this, so no checkout is needed.
+          GH_REPO: ${{ github.repository }}
+          # The commit that was actually deployed and verified, which is not
+          # necessarily today's head of `staging`.
+          DEPLOYED_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          title="Promote staging to production"
+          body="Staging commit ${DEPLOYED_SHA} passed live integration, E2E, and telemetry checks."
+          body="${body}"$'\n\n'"Deploy run: ${RUN_URL}"
+
+          # A staging -> main pull request is long-lived: it stays open across
+          # many staging commits. Creating a second one is not possible anyway
+          # (GitHub allows one open PR per head/base pair), so an existing one
+          # is updated in place to describe the commit that just passed.
+          number="$(gh pr list --base main --head staging --state open \
+            --json number --jq '.[0].number // empty')"
+
+          if [ -n "${number}" ]; then
+            printf 'refreshing pull request #%s for %s\n' "${number}" "${DEPLOYED_SHA}"
+            gh pr edit "${number}" --body "${body}"
+          else
+            printf 'opening the promotion pull request for %s\n' "${DEPLOYED_SHA}"
+            gh pr create --base main --head staging --title "${title}" --body "${body}"
+          fi

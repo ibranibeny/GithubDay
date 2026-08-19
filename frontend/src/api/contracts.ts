@@ -1,0 +1,118 @@
+import { z } from "zod";
+
+export const costMetricSchema = z.enum(["ActualCost", "AmortizedCost"]);
+export type CostMetric = z.infer<typeof costMetricSchema>;
+
+export const costGroupingSchema = z.enum(["ServiceName", "ResourceGroupName", "ResourceId", "Tag"]);
+export type CostGrouping = z.infer<typeof costGroupingSchema>;
+
+export interface CostFilter {
+  from: string;
+  to: string;
+  metric: CostMetric;
+  grouping: CostGrouping;
+  tagKey?: string;
+}
+
+/** The API names the window `start`/`end` and forbids unknown fields, so the UI shape above
+ *  cannot be posted as-is. This is the only filter shape that goes on the wire. */
+export interface ChatFilterWire {
+  start: string;
+  end: string;
+  metric: CostMetric;
+  grouping: CostGrouping;
+  tagKey?: string;
+}
+
+export interface CostPoint {
+  date: string;
+  amount: number;
+  currency: string;
+}
+
+export function normalizeCurrency(currencies: string[]): string {
+  const unique = new Set(currencies);
+  if (unique.size !== 1) {
+    throw new Error("Mixed currencies are not supported");
+  }
+  return currencies[0];
+}
+
+/** The API speaks whole days; a timestamp here would silently shift the window by a timezone. */
+const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be a YYYY-MM-DD date");
+
+/** The API bounds every string it returns; mirroring the bound here stops a replayed or
+ *  tampered payload from rendering an unbounded value into a label. */
+const MAX_ANSWER_LENGTH = 4000;
+const MAX_DIMENSION_LENGTH = 512;
+
+export const evidenceSchema = z.object({
+  metric: costMetricSchema,
+  dimension: z.string().min(1).max(MAX_DIMENSION_LENGTH),
+  periodStart: isoDateSchema,
+  periodEnd: isoDateSchema,
+  amount: z.number().finite(),
+});
+
+export type Evidence = z.infer<typeof evidenceSchema>;
+
+export const chartActionSchema = z.object({
+  kind: z.enum(["set-filter", "highlight-series"]),
+  metric: costMetricSchema.optional(),
+  grouping: costGroupingSchema.optional(),
+  value: z.string().min(1).max(MAX_DIMENSION_LENGTH).optional(),
+  start: isoDateSchema.optional(),
+  end: isoDateSchema.optional(),
+});
+
+export type ChartAction = z.infer<typeof chartActionSchema>;
+
+export const chatResponseSchema = z.object({
+  answer: z.string().max(MAX_ANSWER_LENGTH),
+  evidence: z.array(evidenceSchema),
+  chartActions: z.array(chartActionSchema),
+  explanationAvailable: z.boolean(),
+});
+
+export type ChatResponse = z.infer<typeof chatResponseSchema>;
+
+export interface ChatRequest {
+  prompt: string;
+  filters: ChatFilterWire;
+}
+
+/** The reply may quote account data, so only the failing field paths are surfaced. */
+export class ChatResponseError extends Error {
+  readonly fields: string[];
+
+  constructor(fields: string[]) {
+    super(`The assistant reply did not match the expected shape: ${fields.join(", ")}`);
+    this.name = "ChatResponseError";
+    this.fields = fields;
+  }
+}
+
+export function parseChatResponse(raw: unknown): ChatResponse {
+  const result = chatResponseSchema.safeParse(raw);
+  if (!result.success) {
+    // A payload that is not an object at all fails at the root, whose path is empty.
+    const fields = [...new Set(result.error.issues.map((issue) => issue.path.join(".")))].filter(
+      (field) => field.length > 0,
+    );
+    throw new ChatResponseError(fields.length > 0 ? fields : ["response"]);
+  }
+  return result.data;
+}
+
+/**
+ * A second gate in front of anything that moves the dashboard. The schema already rejects a
+ * malformed reply, but an action can also arrive from a replayed payload or from a future server
+ * that learned a verb this build does not implement.
+ */
+export function isChartAction(value: unknown): value is ChartAction {
+  return chartActionSchema.safeParse(value).success;
+}
+
+export function isEvidence(value: unknown): value is Evidence {
+  return evidenceSchema.safeParse(value).success;
+}

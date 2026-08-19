@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+
+    // Nothing is auto-included from @types: this project is not the web app and must not
+    // silently inherit its DOM library typings by package layout.
+    "types": [],
+    // These specs sit outside the frontend package, so neither TypeScript nor Playwright's own
+    // resolver can walk up to frontend/node_modules. Playwright reads the nearest tsconfig for
+    // each test file and applies these mappings, so one entry serves the type check and the run.
+    "paths": {
+      "@playwright/test": ["../../frontend/node_modules/@playwright/test"],
+      "playwright-core": ["../../frontend/node_modules/playwright-core"]
+    }
+  },
+  "include": ["**/*.ts", "../../frontend/playwright.config.ts"]
+}

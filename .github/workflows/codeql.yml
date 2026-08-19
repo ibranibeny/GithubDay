@@ -1,0 +1,69 @@
+# CodeQL static analysis.
+#
+# Three languages are scanned: the SPA (javascript-typescript), the API
+# (python), and the workflows in this very directory (actions). The third one
+# matters because a workflow is executable code with access to an OIDC token -
+# it deserves the same scrutiny as the application.
+name: CodeQL
+
+on:
+  pull_request:
+    branches:
+      - staging
+      - main
+  push:
+    branches:
+      - staging
+      - main
+  schedule:
+    # Weekly, so a query-pack update finds an old vulnerability even when the
+    # repository is quiet. Monday 04:17 UTC - off the hour to avoid the surge.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Required to publish alerts to the Security tab.
+      security-events: write
+      # Required by the CodeQL action to read workflow run metadata.
+      actions: read
+      contents: read
+    strategy:
+      # One failing language should still let the others report.
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Initialise CodeQL
+        # v3 is deprecated (GitHub announced removal for December 2026) and
+        # emits a warning on every run; v4 is the supported line.
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}

@@ -1,0 +1,104 @@
+# Dependabot version updates.
+#
+# Everything targets `staging`: that is the integration branch, and `main` only
+# ever receives promoted, already-verified changes. Note the consequence -
+# `target-branch` also means Dependabot *security* updates for these ecosystems
+# keep using the repository default branch, because security updates always do.
+#
+# Minor and patch bumps are grouped into a single pull request per ecosystem so
+# the weekly noise stays reviewable. Major bumps are deliberately left
+# ungrouped: they need to be read one at a time.
+version: 2
+
+updates:
+  # --- SPA ------------------------------------------------------------------
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    target-branch: "staging"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+      include: "scope"
+    groups:
+      frontend-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- API ------------------------------------------------------------------
+  # `uv` is a first-class Dependabot ecosystem and is the right key here: it
+  # understands uv.lock, which the `pip` ecosystem does not.
+  - package-ecosystem: "uv"
+    directory: "/backend"
+    target-branch: "staging"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+      include: "scope"
+    groups:
+      backend-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- Container base images ------------------------------------------------
+  - package-ecosystem: "docker"
+    directories:
+      - "/backend"
+      - "/frontend"
+    target-branch: "staging"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      container-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- Workflow actions -----------------------------------------------------
+  # `/` is correct even though the workflows live in .github/workflows -
+  # Dependabot resolves that directory itself for this ecosystem.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "staging"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+      include: "scope"
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

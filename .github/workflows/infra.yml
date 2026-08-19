@@ -1,0 +1,135 @@
+# Manually dispatched Azure infrastructure plans.
+#
+# Every plan runs exactly one of the scripts in infra/scripts/ against the
+# subscription. There is no automatic trigger: provisioning mutates and bills
+# real resources, so a human always starts it.
+#
+# Authentication is OIDC only. `azure/login` exchanges the short-lived GitHub
+# token for an Azure token using a federated credential on a user-assigned
+# managed identity. There is no client secret, no `creds:` JSON blob and no
+# registry password anywhere in this repository.
+#
+# How production is gated, in three independent layers:
+#
+#   1. `plan: production` resolves the job's GitHub Environment to `production`.
+#      Required reviewers on that environment hold the job before any step runs.
+#   2. `vars.AZURE_CLIENT_ID` is environment-scoped, so a production run can only
+#      ever pick up the production deployment identity.
+#   3. That identity's federated credential subject is
+#      `repo:<owner>/<repo>:environment:production`. A job bound to any other
+#      environment cannot obtain a production token even if layers 1 and 2 were
+#      subverted.
+name: Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: Which infrastructure script to run
+        required: true
+        type: choice
+        default: preflight
+        options:
+          - preflight
+          - shared
+          - staging
+          - production
+          - verify
+      environment:
+        description: Target environment - only read by the `verify` plan
+        required: true
+        type: choice
+        default: staging
+        options:
+          - staging
+          - production
+
+permissions:
+  contents: read
+
+# Serialise per plan. Two concurrent runs of the same provisioning script would
+# race on the same Azure resources; queueing (rather than cancelling) means a
+# half-applied plan is always allowed to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.plan }}
+  cancel-in-progress: false
+
+jobs:
+  run-plan:
+    name: ${{ inputs.plan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: >-
+        ${{ (inputs.plan == 'production' || (inputs.plan == 'verify' && inputs.environment == 'production'))
+        && 'production' || 'staging' }}
+    permissions:
+      # The OIDC token for azure/login. Nothing else is needed - these scripts
+      # write to Azure, never to the repository.
+      id-token: write
+      contents: read
+    env:
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      WORKSHOP_GROUP_OBJECT_ID: ${{ vars.WORKSHOP_GROUP_OBJECT_ID }}
+      # Same expression as `environment.name` above, exposed to the shell so the
+      # log records which environment's variables and reviewers were in play.
+      RESOLVED_ENVIRONMENT: >-
+        ${{ (inputs.plan == 'production' || (inputs.plan == 'verify' && inputs.environment == 'production'))
+        && 'production' || 'staging' }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Report the resolved plan
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          printf 'plan        : %s\n' "${PLAN}"
+          printf 'environment : %s\n' "${RESOLVED_ENVIRONMENT}"
+          printf 'subscription: %s\n' "${AZURE_SUBSCRIPTION_ID}"
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run the plan
+        env:
+          PLAN: ${{ inputs.plan }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          case "${PLAN}" in
+            preflight)
+              bash infra/scripts/preflight.sh
+              ;;
+            shared)
+              bash infra/scripts/provision-shared.sh
+              ;;
+            staging)
+              bash infra/scripts/provision-environment.sh staging
+              bash infra/scripts/configure-frontdoor.sh staging
+              ;;
+            production)
+              bash infra/scripts/provision-environment.sh production
+              bash infra/scripts/configure-frontdoor.sh production
+              ;;
+            verify)
+              bash infra/scripts/verify.sh "${TARGET_ENVIRONMENT}"
+              ;;
+            *)
+              printf 'unknown plan: %s\n' "${PLAN}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Sign out of Azure
+        # Clears the cached token from the runner even when the plan failed.
+        if: always()
+        run: az logout || true
