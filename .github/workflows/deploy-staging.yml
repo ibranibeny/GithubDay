@@ -22,7 +22,7 @@
 # Authentication is OIDC only. `azure/login` exchanges the short-lived GitHub
 # token for an Azure token through a federated credential on the staging
 # user-assigned managed identity. There is no client secret, no `creds:` JSON
-# blob and no registry password anywhere in this repository - `az acr build`
+# blob and no registry password anywhere in this repository - the image push
 # and the Container Apps pull both run on that same identity.
 name: Deploy staging
 
@@ -100,35 +100,42 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build the API image in the shared registry
-        # `az acr build` has no --label flag, so the commit reaches the image
-        # through a build argument that the Dockerfile turns into an OCI label.
-        # The mutable `staging` tag is a convenience for humans reading the
-        # registry; nothing in this pipeline ever deploys from it.
+      - name: Build and push the API image to the shared registry
+        # ACR Tasks (az acr build) is not offered in every region, so the image
+        # is built on the runner with Docker and pushed to the registry, which
+        # works from any region. IMAGE_REVISION/SOURCE/CREATED reach the image as
+        # build arguments the Dockerfile turns into OCI labels. The mutable
+        # `staging` tag is a convenience for humans; nothing here deploys from it.
         run: |
           set -Eeuo pipefail
-          az acr build \
-            --registry "${ACR_NAME}" \
-            --image "${BACKEND_IMAGE_REPOSITORY}:${IMAGE_TAG}" \
-            --image "${BACKEND_IMAGE_REPOSITORY}:staging" \
-            --file Dockerfile \
+          az acr login --name "${ACR_NAME}"
+          registry="${ACR_NAME}.azurecr.io"
+          docker build \
+            --file backend/Dockerfile \
+            --tag "${registry}/${BACKEND_IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+            --tag "${registry}/${BACKEND_IMAGE_REPOSITORY}:staging" \
             --build-arg "IMAGE_REVISION=${IMAGE_REVISION}" \
             --build-arg "IMAGE_SOURCE=${IMAGE_SOURCE}" \
             --build-arg "IMAGE_CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             ./backend
+          docker push "${registry}/${BACKEND_IMAGE_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${registry}/${BACKEND_IMAGE_REPOSITORY}:staging"
 
-      - name: Build the web image in the shared registry
+      - name: Build and push the web image to the shared registry
         run: |
           set -Eeuo pipefail
-          az acr build \
-            --registry "${ACR_NAME}" \
-            --image "${FRONTEND_IMAGE_REPOSITORY}:${IMAGE_TAG}" \
-            --image "${FRONTEND_IMAGE_REPOSITORY}:staging" \
-            --file Dockerfile \
+          az acr login --name "${ACR_NAME}"
+          registry="${ACR_NAME}.azurecr.io"
+          docker build \
+            --file frontend/Dockerfile \
+            --tag "${registry}/${FRONTEND_IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+            --tag "${registry}/${FRONTEND_IMAGE_REPOSITORY}:staging" \
             --build-arg "IMAGE_REVISION=${IMAGE_REVISION}" \
             --build-arg "IMAGE_SOURCE=${IMAGE_SOURCE}" \
             --build-arg "IMAGE_CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             ./frontend
+          docker push "${registry}/${FRONTEND_IMAGE_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${registry}/${FRONTEND_IMAGE_REPOSITORY}:staging"
 
       - name: Resolve the images to digests and check their provenance
         # Fails unless both images carry org.opencontainers.image.revision equal
