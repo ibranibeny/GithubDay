@@ -1,0 +1,13 @@
+# Keep the host's installed modules and previous build output out of the build
+# context so `npm ci` decides the dependency tree, not the developer's laptop.
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+
+.env
+.env.*
+
+Dockerfile
+.dockerignore

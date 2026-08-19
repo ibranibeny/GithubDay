@@ -1,0 +1,235 @@
+# Production deployment: promote the EXACT images staging already tested.
+#
+# `push` to `main` is the only trigger, and `main` only ever moves by MERGING a
+# proven `staging` commit - squash and rebase merges are disabled, so the second
+# parent of the new head of `main` is the staging commit that deploy-staging.yml
+# already built, deployed and verified.
+#
+# This workflow therefore rebuilds NOTHING. It:
+#
+#   1. derives that tested staging commit from HEAD^2 (staging-sha.sh), and
+#      refuses to run at all when there is no second parent - a squash, a rebase
+#      or a direct push carries no provenance and must not reach production
+#   2. resolves the git-<sha> tag to immutable digests AND re-checks that both
+#      images still carry org.opencontainers.image.revision == that commit, so a
+#      tag moved since staging cannot smuggle in different bytes
+#   3. deploys those digests, holding traffic back until the new revision is
+#      healthy (deploy.sh)
+#   4. verifies the deployed environment (verify.sh) and runs an independent
+#      live smoke + telemetry check
+#   5. writes a deployment summary recording exactly what shipped
+#
+# The `production` GitHub Environment gates the whole job behind its required
+# reviewers, and `vars.AZURE_CLIENT_ID` is environment-scoped so only the
+# production deployment identity's OIDC token is ever obtainable here. Its
+# federated credential subject is repo:<owner>/<repo>:environment:production.
+#
+# Authentication is OIDC only: no client secret, no `creds:` blob, no registry
+# password anywhere in this repository.
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+
+# Read-only, plus the OIDC token. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+# Never cancel a production deployment in flight: a half-applied traffic shift
+# is worse than a queued run, so a newer push waits instead of interrupting one.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Binding the job to the `production` GitHub Environment holds it behind the
+    # required reviewers and makes `vars.AZURE_CLIENT_ID` resolve to the
+    # production deployment identity - the same string as that identity's
+    # federated credential subject (repo:<owner>/<repo>:environment:production).
+    environment:
+      name: production
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          # The whole history is required: the tested staging commit is the
+          # second parent of this merge, and HEAD^2 cannot be resolved from the
+          # shallow clone actions/checkout produces by default.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Derive the tested staging commit
+        # staging-sha.sh prints HEAD^2 and exits non-zero when there is no second
+        # parent. With pipefail that aborts the job, so a squash, rebase or direct
+        # push to main refuses to deploy instead of shipping un-promoted bytes.
+        run: |
+          set -Eeuo pipefail
+          STAGING_SHA="$(bash infra/scripts/staging-sha.sh)"
+          printf 'STAGING_SHA=%s\n' "${STAGING_SHA}" >>"${GITHUB_ENV}"
+          printf 'IMAGE_TAG=git-%s\n' "${STAGING_SHA}" >>"${GITHUB_ENV}"
+          printf 'tested staging commit: %s\n' "${STAGING_SHA}"
+
+      - name: Resolve the production configuration
+        # infra/config is the single source of truth for resource names. Reading
+        # it here means the workflow never carries a second, drifting copy.
+        run: |
+          set -Eeuo pipefail
+          # shellcheck source=infra/scripts/lib.sh
+          . infra/scripts/lib.sh
+          load_config infra/config/production.env
+          load_config infra/config/shared.env
+          for key in \
+            ACR_NAME SHARED_RESOURCE_GROUP RESOURCE_GROUP \
+            FRONTEND_IMAGE_REPOSITORY BACKEND_IMAGE_REPOSITORY \
+            AFD_PROFILE_NAME AFD_ENDPOINT_NAME \
+            APP_INSIGHTS_NAME VERIFY_TELEMETRY_WINDOW_MINUTES; do
+            printf '%s=%s\n' "${key}" "${!key}" >>"${GITHUB_ENV}"
+          done
+          printf 'tag        : %s\n' "${IMAGE_TAG}"
+          printf 'registry   : %s\n' "${ACR_NAME}"
+          printf 'environment: production\n'
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve the tested images to digests and re-check their provenance
+        # No build step, by design: production ships the exact bytes staging
+        # verified. resolve-digests.sh fails unless both images still carry
+        # org.opencontainers.image.revision == the staging commit, so a tag moved
+        # since staging is caught before a single Azure resource is touched.
+        run: |
+          set -Eeuo pipefail
+          bash infra/scripts/resolve-digests.sh production "${IMAGE_TAG}" "${STAGING_SHA}" >digests.json
+          printf 'FRONTEND_IMAGE=%s\n' "$(jq -r '.frontend.image' digests.json)" >>"${GITHUB_ENV}"
+          printf 'BACKEND_IMAGE=%s\n' "$(jq -r '.backend.image' digests.json)" >>"${GITHUB_ENV}"
+          jq -r '"frontend: \(.frontend.image)", "backend : \(.backend.image)"' digests.json
+
+      - name: Deploy to production
+        # deploy.sh refuses anything that is not <registry>/<repo>@sha256:<64
+        # hex>, shifts traffic only after the new revision reports healthy, and
+        # leaves the previous revision serving if it never does.
+        run: bash infra/scripts/deploy.sh production "${FRONTEND_IMAGE}" "${BACKEND_IMAGE}"
+
+      - name: Verify the production environment
+        run: bash infra/scripts/verify.sh production "${FRONTEND_IMAGE}" "${BACKEND_IMAGE}"
+
+      - name: Resolve the production Front Door hostname
+        env:
+          # Written by bootstrap-oidc.sh once the endpoint exists; the lookup
+          # below covers the first deployment, when it is still empty.
+          FRONTDOOR_HOSTNAME: ${{ vars.FRONTDOOR_HOSTNAME }}
+        run: |
+          set -Eeuo pipefail
+          host="${FRONTDOOR_HOSTNAME}"
+          if [ -z "${host}" ]; then
+            host="$(az afd endpoint show \
+              --endpoint-name "${AFD_ENDPOINT_NAME}" \
+              --profile-name "${AFD_PROFILE_NAME}" \
+              --resource-group "${SHARED_RESOURCE_GROUP}" \
+              --query hostName --output tsv | tr -d '\r')"
+          fi
+          if [ -z "${host}" ]; then
+            printf 'could not resolve the production Front Door hostname\n' >&2
+            exit 1
+          fi
+          printf 'PRODUCTION_BASE_URL=https://%s\n' "${host}" >>"${GITHUB_ENV}"
+          printf 'production base url: https://%s\n' "${host}"
+
+      - name: Smoke test and confirm fresh telemetry
+        # An independent probe on top of verify.sh: the smoke calls travel the
+        # whole path (Front Door -> private link -> the just-shifted revision),
+        # and the telemetry query proves that request was actually served. A
+        # green control plane that never serves a byte is exactly what this
+        # catches.
+        run: |
+          set -Eeuo pipefail
+          health="$(curl --silent --show-error --location --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' \
+            "${PRODUCTION_BASE_URL}/health/live")"
+          if [ "${health}" != "200" ]; then
+            printf 'smoke: /health/live answered %s, expected 200\n' "${health}" >&2
+            exit 1
+          fi
+          content_type="$(curl --silent --show-error --location --max-time 30 \
+            --output /dev/null --write-out '%{content_type}' \
+            "${PRODUCTION_BASE_URL}/")"
+          case "${content_type}" in
+            text/html*) : ;;
+            *)
+              printf 'smoke: / returned %s, expected HTML\n' "${content_type:-no response}" >&2
+              exit 1
+              ;;
+          esac
+          printf 'smoke: /health/live 200 and the SPA is served\n'
+
+          # verify.sh already gates on telemetry; this repeats the query only to
+          # put a concrete request count in the summary. A query error is not
+          # re-failed here (verify.sh owns that gate), but an empty window still
+          # is, because the smoke call above should itself have registered.
+          az extension add --name application-insights --upgrade --only-show-errors --output none >/dev/null 2>&1 || true
+          window="${VERIFY_TELEMETRY_WINDOW_MINUTES:-30}"
+          ai_id="$(az monitor app-insights component show \
+            --app "${APP_INSIGHTS_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query id --output tsv 2>/dev/null | tr -d '\r' || true)"
+          count=""
+          if [ -n "${ai_id}" ]; then
+            count="$(az monitor app-insights query \
+              --app "${ai_id}" \
+              --analytics-query "requests | where timestamp > ago(${window}m) | count" \
+              --query 'tables[0].rows[0][0]' --output tsv 2>/dev/null | tr -d '\r' || true)"
+          fi
+          count="${count:-0}"
+          if [ "${count}" -gt 0 ] 2>/dev/null; then
+            printf 'telemetry: %s request(s) reached Application Insights in the last %s min\n' "${count}" "${window}"
+          else
+            printf 'telemetry: no request reached Application Insights in the last %s min\n' "${window}" >&2
+            exit 1
+          fi
+          printf 'TELEMETRY_COUNT=%s\n' "${count}" >>"${GITHUB_ENV}"
+
+      - name: Write the deployment summary
+        # Always runs, so a failed attempt still records what it tried to ship.
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          verify_result='all checks passed'
+          [ "${{ job.status }}" = 'success' ] || verify_result='incomplete - see the job logs'
+          {
+            printf '## Production deployment\n\n'
+            printf '| Field | Value |\n'
+            printf '| --- | --- |\n'
+            printf '| Status | %s |\n' "${{ job.status }}"
+            printf '| Tested staging commit | `%s` |\n' "${STAGING_SHA:-unknown}"
+            printf '| Image tag | `%s` |\n' "${IMAGE_TAG:-unknown}"
+            printf '| Frontend image | `%s` |\n' "${FRONTEND_IMAGE:-unresolved}"
+            printf '| Backend image | `%s` |\n' "${BACKEND_IMAGE:-unresolved}"
+            printf '| Front Door | %s |\n' "${PRODUCTION_BASE_URL:-unresolved}"
+            printf '| Verify | %s |\n' "${verify_result}"
+            printf '| Telemetry | %s request(s) in the last %s min |\n' "${TELEMETRY_COUNT:-0}" "${VERIFY_TELEMETRY_WINDOW_MINUTES:-?}"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Sign out of Azure
+        # Clears the cached token from the runner even when a step above failed.
+        if: always()
+        run: az logout || true

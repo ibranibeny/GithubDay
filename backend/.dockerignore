@@ -1,0 +1,23 @@
+# Build context hygiene: keep host-only artefacts and anything secret out of
+# the image layers and out of the build cache key.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Tests are not shipped in the runtime image.
+tests/
+
+# Never bake local secrets into a layer.
+.env
+.env.*
+
+Dockerfile
+.dockerignore
