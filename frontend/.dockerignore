@@ -9,5 +9,5 @@ test-results/
 .env
 .env.*
 
-Dockerfile
-.dockerignore
+# Do not ignore Dockerfile/.dockerignore here: az acr build uploads this context
+# as a tarball honoring this file, so excluding them fails with "Unable to find 'Dockerfile'".
