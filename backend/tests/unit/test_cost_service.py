@@ -12,7 +12,7 @@ from cost_copilot.clients.cost_management import (
     parse_query_result,
 )
 from cost_copilot.models.cost import CostFilter, CostGrouping, CostMetric
-from cost_copilot.services.cost_service import CostService
+from cost_copilot.services.cost_service import CachingCostQueryRunner, CostService
 from fixture_data import cost_fixture
 
 NOW = datetime(2026, 8, 18, 9, 30, tzinfo=UTC)
@@ -321,3 +321,29 @@ async def test_the_service_uses_a_real_clock_by_default() -> None:
     trend = await service.trend(a_filter())
 
     assert trend.generated_at.tzinfo is UTC
+
+
+async def test_a_cached_query_is_reused_without_a_second_upstream_call() -> None:
+    """A repeated dashboard query is served from the cache, not re-fetched."""
+    client = StubCostClient(a_dataset((date(2026, 8, 1), "a", 1.0)), a_dataset())
+    runner = CachingCostQueryRunner(client)
+
+    first = await runner.run_query(a_filter(), "Daily")
+    second = await runner.run_query(a_filter(), "Daily")
+
+    assert first is second
+    assert len(client.calls) == 1
+
+
+async def test_concurrent_upstream_calls_are_held_to_the_concurrency_cap() -> None:
+    """A dashboard burst of distinct queries must not exceed the semaphore's limit."""
+    client = StubCostClient(a_dataset())
+    runner = CachingCostQueryRunner(client, max_concurrency=2)
+    # Distinct start dates keep the keys apart so the per-key lock cannot collapse
+    # them; without the semaphore all five would be in flight at once.
+    windows = [a_filter(start=date(2026, 8, day)) for day in (1, 2, 3, 4, 5)]
+
+    await asyncio.gather(*(runner.run_query(window, "Daily") for window in windows))
+
+    assert len(client.calls) == 5
+    assert client.peak_in_flight == 2
