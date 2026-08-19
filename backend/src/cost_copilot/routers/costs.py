@@ -31,7 +31,7 @@ from cost_copilot.models.cost import (
     CostSummary,
     CostTrend,
 )
-from cost_copilot.services.cost_service import CostService
+from cost_copilot.services.cost_service import CachingCostQueryRunner, CostService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/costs", tags=["costs"])
@@ -68,7 +68,10 @@ async def cost_service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         setattr(app.state, CREDENTIAL_STATE_ATTRIBUTE, credential)
         client = build_cost_client(get_settings(), acquire_token=tokens)
         resources.push_async_callback(client.aclose)
-        setattr(app.state, COST_SERVICE_STATE_ATTRIBUTE, CostService(client))
+        # A short TTL cache collapses the dashboard's duplicate Daily queries and
+        # lets refreshes reuse results, keeping clear of the Cost Management 429s.
+        cached = CachingCostQueryRunner(client)
+        setattr(app.state, COST_SERVICE_STATE_ATTRIBUTE, CostService(cached))
         yield
 
 
