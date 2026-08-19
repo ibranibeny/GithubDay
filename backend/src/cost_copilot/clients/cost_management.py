@@ -82,8 +82,16 @@ BASE_RETRY_DELAY_SECONDS = 1.0
 MAX_RETRY_DELAY_SECONDS = 30.0
 RETRY_JITTER_FRACTION = 0.25
 RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
-# 429 answers carry a Consumption-specific header; 503 answers use the standard one.
-RETRY_AFTER_HEADERS = ("x-ms-ratelimit-microsoft.consumption-retry-after", "retry-after")
+# A throttled answer states how long to wait, per throttle dimension. Cost Management
+# query 429s carry resource-specific headers (client-type is usually the binding one);
+# Consumption and generic 503s use their own. The longest hint present is honoured.
+RETRY_AFTER_HEADERS = (
+    "x-ms-ratelimit-microsoft.costmanagement-clienttype-retry-after",
+    "x-ms-ratelimit-microsoft.costmanagement-entity-retry-after",
+    "x-ms-ratelimit-microsoft.costmanagement-tenant-retry-after",
+    "x-ms-ratelimit-microsoft.consumption-retry-after",
+    "retry-after",
+)
 
 DATE_COLUMN_NAMES = frozenset({"usagedate", "billingmonth"})
 CURRENCY_COLUMN_NAMES = frozenset({"currency", "billingcurrency", "billingcurrencycode"})
@@ -548,6 +556,7 @@ def _validated_next_link(next_link: str) -> str:
 
 
 def _retry_delay(response: httpx.Response, attempt: int, jitter: float) -> float:
+    hinted: float | None = None
     for header in RETRY_AFTER_HEADERS:
         raw = response.headers.get(header)
         if raw is None:
@@ -557,7 +566,11 @@ def _retry_delay(response: httpx.Response, attempt: int, jitter: float) -> float
         except ValueError:
             continue  # an HTTP-date form is ignored in favour of the local backoff
         if seconds >= 0:
-            return min(seconds, MAX_RETRY_DELAY_SECONDS)
+            # Several dimensions can throttle at once; wait out the longest so a
+            # retry does not fire before the binding window has reset.
+            hinted = seconds if hinted is None else max(hinted, seconds)
+    if hinted is not None:
+        return min(hinted, MAX_RETRY_DELAY_SECONDS)
     return _backoff(attempt, jitter)
 
 

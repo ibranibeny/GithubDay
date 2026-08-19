@@ -349,6 +349,32 @@ async def test_throttling_is_retried_using_retry_after_then_succeeds(
 
 
 @respx.mock
+async def test_cost_management_retry_after_headers_wait_the_longest_hint(
+    client: CostManagementClient, recorded_delays: list[float]
+) -> None:
+    """A real Cost Management 429 carries resource-specific Retry-After headers, not the
+    generic one; the client must wait the longest so it does not retry before the binding
+    window has reset."""
+    respx.post(QUERY_URL).mock(
+        side_effect=[
+            httpx.Response(
+                429,
+                headers={
+                    "x-ms-ratelimit-microsoft.costmanagement-entity-retry-after": "3",
+                    "x-ms-ratelimit-microsoft.costmanagement-clienttype-retry-after": "10",
+                },
+            ),
+            httpx.Response(200, json=cost_fixture("groupedDaily")),
+        ]
+    )
+
+    dataset = await client.run_query(a_filter(), "Daily")
+
+    assert len(dataset.records) == 4
+    assert recorded_delays == [10.0]
+
+
+@respx.mock
 async def test_retry_after_is_capped_and_falls_back_when_unparsable(
     client: CostManagementClient, recorded_delays: list[float]
 ) -> None:
