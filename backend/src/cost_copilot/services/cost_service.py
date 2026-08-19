@@ -36,19 +36,28 @@ class CostQueryRunner(Protocol):
 
 
 class CachingCostQueryRunner:
-    """A short in-memory TTL cache in front of a CostQueryRunner.
+    """A short in-memory TTL cache and concurrency limiter over a CostQueryRunner.
 
-    The Cost Management Query API is aggressively rate limited (HTTP 429), and the
-    dashboard fans several endpoints out onto the *same* Daily grouped query.
-    Caching by query for a short window, with a single in-flight call per key,
-    collapses those duplicates and lets a refresh reuse the last result.
+    The Cost Management Query API is aggressively rate limited (HTTP 429) on a
+    rolling few-second window, and the dashboard fans several endpoints out onto
+    the *same* Daily grouped query. Caching by query (one in-flight call per key)
+    collapses duplicates and lets refreshes reuse results; a small semaphore caps
+    how many distinct queries hit the API at once so a burst cannot exhaust the
+    window and leave every query stalled behind the retry backoff.
     """
 
-    def __init__(self, inner: CostQueryRunner, *, ttl_seconds: float = 180.0) -> None:
+    def __init__(
+        self,
+        inner: CostQueryRunner,
+        *,
+        ttl_seconds: float = 180.0,
+        max_concurrency: int = 2,
+    ) -> None:
         self._inner = inner
         self._ttl = ttl_seconds
         self._entries: dict[str, tuple[float, CostDataset]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._gate = asyncio.Semaphore(max_concurrency)
 
     async def run_query(self, filters: CostFilter, granularity: str) -> CostDataset:
         key = self._key(filters, granularity)
@@ -61,7 +70,10 @@ class CachingCostQueryRunner:
             cached = self._fresh(key)
             if cached is not None:
                 return cached
-            result = await self._inner.run_query(filters, granularity)
+            # Cap concurrent upstream calls so a dashboard burst fits the API's
+            # rolling window instead of throttling every query at once.
+            async with self._gate:
+                result = await self._inner.run_query(filters, granularity)
             self._entries[key] = (time.monotonic(), result)
             return result
 

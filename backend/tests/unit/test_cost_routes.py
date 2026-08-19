@@ -36,7 +36,7 @@ from cost_copilot.routers.costs import (
     build_cost_client,
     get_cost_service,
 )
-from cost_copilot.services.cost_service import CostService
+from cost_copilot.services.cost_service import CachingCostQueryRunner, CostService
 from fixture_data import cost_fixture
 
 CLAIMS = {"oid": "00000000-0000-0000-0000-000000000002", "roles": [COST_READER_ROLE]}
@@ -359,7 +359,11 @@ def test_the_production_cost_client_and_credential_are_closed_on_shutdown(
     with TestClient(app):
         service = app.state.cost_service
         assert isinstance(service, CostService)
-        cost_client = service.client
+        # The service now runs its queries through the caching wrapper; the real
+        # pooled client it owns is the one whose shutdown we are checking.
+        runner = service.client
+        assert isinstance(runner, CachingCostQueryRunner)
+        cost_client = runner._inner
         assert isinstance(cost_client, CostManagementClient)
         assert not cost_client.is_closed
 
