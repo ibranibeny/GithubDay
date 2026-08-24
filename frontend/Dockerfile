@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 # Build stage: produce the static bundle with the exact locked dependencies.
 # ---------------------------------------------------------------------------
-FROM node:22-slim AS build
+FROM node:26-slim AS build
 
 WORKDIR /app
 
