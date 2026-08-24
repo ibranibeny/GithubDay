@@ -21,7 +21,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # ---------------------------------------------------------------------------
 # Runtime: the same Debian release as the builder so the venv ABI matches.
 # ---------------------------------------------------------------------------
-FROM python:3.13-slim-trixie AS runtime
+FROM python:3.14-slim-trixie AS runtime
 
 # Provenance. `az acr build` has no --label flag, so the deployment workflow
 # passes these with --build-arg and infra/scripts/resolve-digests.sh refuses to
