@@ -17,7 +17,7 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # Runtime stage: nginx-unprivileged already runs as uid 101 on port 8080.
 # ---------------------------------------------------------------------------
-FROM nginxinc/nginx-unprivileged:1.29-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS runtime
 
 # Provenance. `az acr build` has no --label flag, so the deployment workflow
 # passes these with --build-arg and infra/scripts/resolve-digests.sh refuses to
